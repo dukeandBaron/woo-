@@ -15,7 +15,7 @@ dependencies = [
   # compatibility run and reviewed lockfile update; newer NumPy is not ruled out.
   "defusedxml>=0.7.1,<0.8",
   "numpy>=2.2,<2.6",
-  "pillow>=11,<13",
+  "pillow>=11,<14",
   "pydantic>=2.12,<3",
   "PyYAML>=6,<7",
   "rfc8785>=0.1,<0.2",
