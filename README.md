@@ -17,9 +17,9 @@
 </p>
 
 <p align="center">
-  <a href="https://dukeandbaron.github.io/visiondata-gate/"><strong>在线 Demo</strong></a> ·
-  <a href="https://dukeandbaron.github.io/visiondata-gate/#/review"><strong>60 秒评审核验</strong></a> ·
-  <a href="https://dukeandbaron.github.io/visiondata-gate/#/workspace"><strong>图像工作簿</strong></a> ·
+  <a href="https://dukeandbaron.github.io/woo-/"><strong>在线 Demo</strong></a> ·
+  <a href="https://dukeandbaron.github.io/woo-/#/review"><strong>60 秒评审核验</strong></a> ·
+  <a href="https://dukeandbaron.github.io/woo-/#/workspace"><strong>图像工作簿</strong></a> ·
   <a href="https://github.com/dukeandBaron/visiondata-gate/releases"><strong>Windows 下载</strong></a> ·
   <a href="#quickstart"><strong>本地运行</strong></a>
 </p>
@@ -235,7 +235,7 @@ Finding 数量减少不能直接关闭责任。系统必须逐项核对已关闭
 | **公开合成 Agent 案件** | 查看触发证据、Worker 选择／拒绝、竞争假设、预算、CAPA 血缘和六阶段 Trace | SHA 绑定的静态回放；不冒充当前上传图片的 Agent 结果 |
 | **本地完整工作台** | 使用账户、项目和持久化 API，执行具名决定、派生整改、Child Run 与支持的模型任务 | 本机受控运行；客户验收和生产授权需另行取证 |
 
-[按 60 秒评审核验路径打开 Demo](https://dukeandbaron.github.io/visiondata-gate/#/review) · [现场改变输入并复现](docs/LIVE_REPRODUCTION.md)
+[按 60 秒评审核验路径打开 Demo](https://dukeandbaron.github.io/woo-/#/review) · [现场改变输入并复现](docs/LIVE_REPRODUCTION.md)
 
 ### 冻结结果与适用边界
 
@@ -261,7 +261,7 @@ Finding 数量减少不能直接关闭责任。系统必须逐项核对已关闭
 
 ### 在线体验
 
-[打开在线 Demo](https://dukeandbaron.github.io/visiondata-gate/) 或 [直接进入图像工作簿](https://dukeandbaron.github.io/visiondata-gate/#/workspace)。在线站点是静态公开体验，不提供账户、持久化业务后端或生产授权。
+[打开在线 Demo](https://dukeandbaron.github.io/woo-/) 或 [直接进入图像工作簿](https://dukeandbaron.github.io/woo-/#/workspace)。在线站点是静态公开体验，不提供账户、持久化业务后端或生产授权。
 
 ### 本地完整工作台
 
