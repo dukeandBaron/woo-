@@ -57,9 +57,18 @@ Target: **100 evidence-backed engineering iterations**. Count one round only whe
 - Red: five missing-engine checks failed; a separate RED showed a caller mutation after training could enter the receipt until the draft was copied. Final green: 66 passed / 1 Windows symlink skip across the reference and frozen-dataset suites.
 - Measured synthetic reference: 3 train / 1 val / 1 test; 2 fit epochs, 6 visits, 4 optimizer steps; 27,840 checkpoint bytes. Replacing both holdouts kept the checkpoint byte-identical. The actual worker timeout was exercised; no detector evaluation or live product execution occurred.
 
+## R006: Measure like-for-like synthetic validation reconstruction
+
+- Test the evaluator first in `tests/test_vision_pretraining_comparison.py`. Refuse an unpinned run receipt or changed checkpoint and verify the exact masks, RGB targets and denominator used for both arms.
+- Add `visiondata_gate.vision_pretraining_comparison`: reconstruct the exact seeded initialization, match its digest to the fit receipt, verify the saved candidate, and score both on the same frozen val images. Preserve signed-off test split exclusion and avoid downstream detector claims.
+- Run `tools/run_vision_pretraining_reference_fixture.py` into new isolated directories with fixed generated data, finite CPU budget and seeds. Record both arms and an independent repeat.
+- Red: 2 checks failed for the absent evaluator. Final green: 68 passed, 1 Windows symlink skip (reference fit, evaluator and frozen datasets). Ruff and Git whitespace checks passed.
+- Reproduce with the project's installed Python: `python tools/run_vision_pretraining_reference_fixture.py --output-dir <new-local-dir> --allow-reference-execution`. Fixed fixture: 8 train / 2 val / 2 test; train seed 19, validation mask seed 983, 5 CPU fit epochs, batch 2, one thread, 30-second budget.
+- Both actual runs recorded 20 optimizer steps and the same checkpoint SHA-256 `b1cdf779f3a4b1fd32a31f12a60efc86285f16c4c1af07294d157de4f5afd982`. Across the same two synthetic validation images, 20 masks / 15,360 masked RGB scalar targets, the random-vs-fitted MSE was `0.008579801526392029` vs `0.00851170729843469`. Test, downstream detector performance and live execution remain unmeasured; agreement on this environment is not portability or industrial effectiveness evidence.
+
 ## Next gates (proposed, not counted)
 
-1. Reference evaluation: reopen the sealed reference checkpoint and test a matched synthetic validation comparison; the test split stays reserved. Do not claim downstream detector improvement.
-2. Transfer and execution authority: verify an actual downstream encoder adapter and an explicit, scoped launch approval before connecting an executable route to the workbench.
+1. Transfer and execution authority: verify an actual downstream encoder adapter and an explicit, scoped launch approval before connecting an executable route to the workbench.
+2. Downstream validation: when the adapter is verified, compare two separately trained detector arms with matched data, seed and budget; accept no inference from reconstruction alone.
 3. Data: time annotation import/export and dataset verification on fixed licensed workloads; account for sample counts and recheck split isolation. Add caching only after measuring a bottleneck and without weakening freshness or authorization.
 4. Iteration: compare errors at a fixed operating policy, require human approval for changes, preserve failures and never use training completion as release authority.
