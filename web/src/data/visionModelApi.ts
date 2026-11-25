@@ -1,13 +1,15 @@
 import { operatorFetch, OperatorApiError } from './api';
-import { getIdentityActorId } from '../identitySession.ts';
+import { getIdentityActorId, getIdentitySessionSnapshot } from '../identitySession.ts';
 import { getDataPool } from './dataPoolApi.ts';
 import {
   VisionContractError, validateVisionScope, validateVisionRequest, validateVisionRecord, validateVisionList,
+  validateVisionTrainingProposal, validateVisionTrainingPreflight,
   validateVisionCapabilities, validateVisionTttCapabilities, validateVisionOperationReceipt, validateVisionFeedbackList, validateNormalityFeedbackList, validateNormalityFollowupList, validateNormalityFollowupAnnotations, isNormalityFollowupOperation, visionEnsure, visionId, visionDigest, validateVisionOperation,
 } from '../visionModelDomain.ts';
 import type { VisionScope, VisionKind, VisionRecord, VisionModel, VisionRuntime, VisionDataset, VisionRun, VisionInferenceAsset, VisionInference,
   VisionCapabilities, VisionMutationOperation, VisionPending, VisionOperationReceipt, VisionFeedback, NormalityFeedback, VisionTttFailure, VisionTttCapabilities,
-  NormalityFollowupImport, NormalityFollowupWorkOrder, NormalityFollowupList, NormalityFollowupAnnotations, NormalityFollowupKind } from '../visionModelDomain.ts';
+  NormalityFollowupImport, NormalityFollowupWorkOrder, NormalityFollowupList, NormalityFollowupAnnotations, NormalityFollowupKind,
+  VisionTrainingProposal, VisionTrainingPreflight } from '../visionModelDomain.ts';
 
 /** No retries, downloads, implicit probes or training. All mutation calls are explicit. */
 const collection: Record<VisionKind, string> = { model: 'vision-models', runtime: 'vision-runtimes', dataset: 'vision-datasets', run: 'vision-training-runs',
@@ -25,6 +27,18 @@ async function read<T>(scope: VisionScope, path: string, check: (value: unknown,
 }
 export function getVisionCapabilities(scope: VisionScope): Promise<VisionCapabilities> {
   return read(scope, `${base(scope)}/vision-capabilities`, (v, r) => validateVisionCapabilities(v, scope, r.headers.get('ETag'), r.headers.get('X-Content-SHA256')));
+}
+/** POST carries a sizable proposal, but this endpoint is read-only: no write lock, grant, or retry. */
+export async function previewVisionTraining(scope: VisionScope, input: VisionTrainingProposal, signal?: AbortSignal): Promise<VisionTrainingPreflight> {
+  const path = `${base(scope)}/vision-training-preflight`, generation = getIdentitySessionSnapshot().generation;
+  const body = JSON.stringify(validateVisionTrainingProposal(input));
+  const checkContext = () => { signal?.throwIfAborted(); scoped(scope); visionEnsure(getIdentitySessionSnapshot().generation === generation); };
+  checkContext();
+  const response = await operatorFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal });
+  checkContext();
+  const result = await validateVisionTrainingPreflight(await payload(response), scope, JSON.parse(body), response.headers.get('ETag'), response.headers.get('X-Content-SHA256'));
+  checkContext();
+  return result;
 }
 export function getVisionTttCapabilities(scope: VisionScope): Promise<VisionTttCapabilities> {
   return read(scope, `${base(scope)}/vision-ttt-capabilities`, (v, r) => validateVisionTttCapabilities(v, scope, r.headers.get('ETag'), r.headers.get('X-Content-SHA256')));

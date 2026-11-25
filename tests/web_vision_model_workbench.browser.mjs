@@ -48,6 +48,20 @@ export async function operatorFetch(path,init={}){
     return response({schema_version:'visiondata-gate.vision-operation.v1',project_id:window.__scope.projectId,operation,request_key,resource_id:item.resource_id,resource:item,auto_replayed:false});}
    throw new OperatorApiError('HTTP_404','not found',404);
  }
+ if(suffix==='vision-training-preflight'){
+   if(window.__delayPreflight){window.__delayPreflight=false;await new Promise(resolve=>{window.__releasePreflight=resolve;});}
+   if(window.__failPreflight)throw new OperatorApiError('VISION_INPUT_OR_RUNTIME_CONTRACT_INVALID','C:/private/preflight/source',409);
+   const d=db.datasets.find(item=>item.dataset_id===request.dataset_id), warm=request.initialization==='REGISTERED_WEIGHTS';
+   const result=await response({schema_version:'visiondata-gate.vision-training-preflight.v1',project_id:window.__scope.projectId,
+     status:'READY_FOR_OPERATOR_REVIEW',inputs_sha256:await hash(request),training_mode:warm?'SUPERVISED_DETECTION_WARM_START':'SUPERVISED_DETECTION_FROM_SCRATCH',
+     architecture:'yolo26n',device:'cpu',training:request.training,adaptation:'OFF',
+     dataset:{id:d.dataset_id,receipt_sha256:d.dataset_receipt_sha256,provenance:d.provenance||'UNBOUND_EXTERNAL_FIXTURE',split_counts:d.dataset_receipt.split_counts,class_count:d.dataset_receipt.class_names.length},
+     runtime:{id:request.runtime_id,sha256:request.expected_runtime_sha256},weights:warm?{model_id:request.initial_model_id,sha256:request.expected_weights_sha256}:null,
+     requires_operator_training_authorization:true,requires_weight_load_authorization:warm,self_supervised_pretraining_supported:false,run_created:false,runtime_executed:false,
+     test_evaluation:'NOT_RUN',production_release_allowed:false,machine_write_permitted:false});
+   window.__preflightsDelivered=(window.__preflightsDelivered||0)+1;
+   return result;
+ }
  let resource,operation;
  if(suffix.startsWith('normality-feedback/')&&suffix.endsWith('/followup-import')){operation='import_normality_followup:'+suffix.split('/')[1];resource=await sealed({...db.followupImportTemplate,reviewer_identity:request.reviewer_identity,note:request.note});db.followupImports=[resource];}
  else if(suffix.startsWith('normality-feedback/')&&suffix.endsWith('/followup-work-orders')){operation='create_normality_followup_work_order:'+suffix.split('/')[1];const imported=db.followupImports.find(row=>row.import_id===request.import_id);resource=await sealed({...db.followupOrderTemplate,import_sha256:imported.receipt_sha256,annotation_id:request.annotation_id,annotation_revision:request.expected_annotation_revision,annotation_document_sha256:request.expected_annotation_document_sha256,reviewer_identity:request.reviewer_identity,note:request.note,assignee:request.assignee});db.followupOrders=[resource];}
@@ -120,7 +134,9 @@ async function tab(page, name) { await page.getByRole('navigation', { name: '视
 function form(page) { return page.locator('.vision-models__form-panel form'); }
 async function review(target) { await target.getByLabel('具名复核人', { exact: true }).fill('合成复核员'); await target.getByLabel('本次操作说明').fill('这是独立合成测试的具名授权说明'); }
 async function checked(target, label) { await target.getByLabel(label, { exact: false }).check(); }
-async function writes(page) { return page.evaluate(() => window.__calls.filter(call => call.method === 'POST')); }
+async function writes(page) { return page.evaluate(() => window.__calls.filter(call => call.method === 'POST' && !call.path.endsWith('/vision-training-preflight'))); }
+function preflightButton(target) { return target.getByRole('button', { name: '运行预检（不启动训练）' }); }
+async function preflight(target) { await preflightButton(target).click(); await target.getByText('预检已核验 · 等待人工授权', { exact: true }).waitFor(); }
 
 test('four real stages are read-only on open, and unsupported backend holds without mock UI data', async () => {
   const page = await openPage(); try {
@@ -165,6 +181,8 @@ test('random architecture training remains non-pretrained, then zero-metric cand
   const page = await openPage(); try {
     await tab(page, '训练'); const target = form(page); await target.getByLabel('运行环境', { exact: true }).selectOption('vision_runtime_test'); await target.getByLabel('冻结数据集', { exact: true }).selectOption('vision_dataset_test'); await review(target);
     await checked(target, '我已核查 Ultralytics'); await checked(target, '我信任所选 Python'); await checked(target, '我授权按上述数据集');
+    assert.equal(await target.getByRole('button', { name: '按本次授权启动 CPU 训练' }).isEnabled(), false);
+    await preflight(target);
     await target.getByRole('button', { name: '按本次授权启动 CPU 训练' }).click();
     await page.getByRole('button', { name: /已授权 · 等待执行/ }).waitFor(); const posts = await writes(page); assert.equal(posts.length, 1);
     assert.equal(posts[0].request.initial_model_id, null); assert.equal(posts[0].request.operator_attests_pickle_load_risk, false); assert.equal(posts[0].request.adaptation, 'OFF');
@@ -181,10 +199,40 @@ test('registered .pt training requires trusted-weights and distinct pickle-load 
   const page = await openPage(); try {
     await tab(page, '训练'); const target = form(page); await target.getByLabel('运行环境', { exact: true }).selectOption('vision_runtime_test'); await target.getByLabel('冻结数据集', { exact: true }).selectOption('vision_dataset_test');
     await target.getByLabel('初始化方式').selectOption('REGISTERED_WEIGHTS'); await target.getByLabel('本地初始权重').selectOption('vision_model_test'); await review(target);
+    await preflight(target);
     await checked(target, '我已核查 Ultralytics'); await checked(target, '我信任所选 Python'); await checked(target, '我授权按上述数据集'); await checked(target, '我确认所选权重来自可信来源');
     const submit = target.getByRole('button', { name: '按本次授权启动 CPU 训练' }); assert.equal(await submit.isEnabled(), false);
     await checked(target, '我单独确认 .pt'); await submit.click(); await page.getByRole('button', { name: /已授权 · 等待执行/ }).waitFor();
     const [call] = await writes(page); assert.equal(call.request.operator_attests_pickle_load_risk, true); assert.equal(call.request.operator_attests_trusted_weights, true); assert.equal(call.request.expected_weights_sha256, sha());
+  } finally { await page.close(); }
+});
+test('preflight is explicit, never writes, and data, weights, and budget invalidate it including an A→B→A late response', async () => {
+  const page = await openPage(); try {
+    const next = await newDetectionDataset();
+    const nextModel = await seal({ ...await model(), resource_id: 'vision_model_next', model_id: 'vision_model_next', weights_sha256: sha('d') });
+    await page.evaluate(({ next, nextModel }) => { window.__db.datasets.push(next); window.__db.models.push(nextModel); }, { next, nextModel });
+    await page.getByRole('button', { name: '刷新状态（仅 GET）' }).click();
+    await tab(page, '训练'); const target = form(page);
+    const runtimeField = target.getByLabel('运行环境', { exact: true }), datasetField = target.getByLabel('冻结数据集', { exact: true });
+    const submit = target.getByRole('button', { name: '按本次授权启动 CPU 训练' }), epochs = target.getByLabel('轮次', { exact: true });
+    const marker = target.getByText('预检已核验 · 等待人工授权', { exact: true });
+    await runtimeField.selectOption('vision_runtime_test'); await datasetField.selectOption('vision_dataset_test');
+    await preflight(target); assert.equal(await submit.isEnabled(), false);
+    assert.equal(await page.evaluate(() => Object.keys(localStorage).length), 0);
+    await datasetField.selectOption('vision_dataset_new'); assert.equal(await marker.count(), 0);
+    await preflight(target); await epochs.fill('2'); assert.equal(await marker.count(), 0);
+    await target.getByLabel('初始化方式').selectOption('REGISTERED_WEIGHTS');
+    const weights = target.getByLabel('本地初始权重'); await weights.selectOption('vision_model_test');
+    await preflight(target); await weights.selectOption('vision_model_next'); assert.equal(await marker.count(), 0);
+    await page.evaluate(() => { window.__delayPreflight = true; }); await preflightButton(target).click();
+    await page.waitForFunction(() => typeof window.__releasePreflight === 'function');
+    await epochs.fill('3'); await epochs.fill('2');
+    await page.evaluate(() => window.__releasePreflight()); await page.waitForFunction(() => window.__preflightsDelivered === 4);
+    assert.equal(await marker.count(), 0); assert.equal(await submit.isEnabled(), false);
+    await page.evaluate(() => { window.__failPreflight = true; }); await preflightButton(target).click();
+    await target.getByRole('alert').filter({ hasText: '预检' }).waitFor();
+    assert.equal((await target.innerText()).includes('C:/private'), false); assert.equal((await writes(page)).length, 0);
+    assert.equal(await page.evaluate(() => Object.keys(localStorage).length), 0);
   } finally { await page.close(); }
 });
 test('unknown POST retains actor-scoped minimal lock, refresh cannot clear it, exact GET operation reconciles without replay', async () => {
@@ -282,6 +330,7 @@ test('validation disagreements require human triage and next-run association nee
     assert.equal(await target.getByRole('button', { name: '按本次授权启动 CPU 训练' }).isEnabled(), false);
     await target.getByLabel('冻结数据集', { exact: true }).selectOption('vision_dataset_new'); await review(target);
     await checked(target, '我已核查 Ultralytics'); await checked(target, '我信任所选 Python'); await checked(target, '我授权按上述数据集');
+    await preflight(target);
     await target.getByRole('button', { name: '按本次授权启动 CPU 训练' }).click(); await page.getByRole('button', { name: /已授权 · 等待执行/ }).waitFor();
     const posts = await writes(page); assert.equal(posts.length, 2); assert.ok(posts[0].path.endsWith(`/feedback/${fixture.feedback.feedback_id}/triage`));
     assert.deepEqual(posts[1].request.responds_to_feedback_ids, [fixture.feedback.feedback_id]); assert.equal(posts[1].request.dataset_id, 'vision_dataset_new');

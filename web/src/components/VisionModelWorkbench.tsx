@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Activity, Cpu, Database, FileCheck2, RefreshCw, ShieldCheck, SlidersHorizontal } from 'lucide-react';
 import { useProduct } from '../ProductContext';
-import { getIdentityActorId } from '../identitySession.ts';
+import { getIdentityActorId, getIdentitySessionSnapshot, subscribeIdentitySession } from '../identitySession.ts';
 import { getVisionCapabilities, listVisionRecords, getVisionRun, getVisionModel, getVisionInferenceAsset, getVisionInference, getVisionOperation, getVisionFeedback,
-  getVisionPool, getVisionHeatmap, getNormalityFeedback, getNormalityFollowup, getNormalityFollowupAnnotations, getVisionTttCapabilities, prepareVisionMutation, sendVisionMutation, visionWriteKnownRejected, visionErrorMessage } from '../data/visionModelApi.ts';
-import { parseDetectionManifest, parseVisionPending, visionPendingStorageKey, visionStatusLabel, visionEnsure } from '../visionModelDomain.ts';
+  getVisionPool, getVisionHeatmap, getNormalityFeedback, getNormalityFollowup, getNormalityFollowupAnnotations, getVisionTttCapabilities, previewVisionTraining, prepareVisionMutation, sendVisionMutation, visionWriteKnownRejected, visionErrorMessage } from '../data/visionModelApi.ts';
+import { parseDetectionManifest, parseVisionPending, validateVisionTrainingProposal, visionPendingStorageKey, visionStatusLabel, visionEnsure } from '../visionModelDomain.ts';
 import type { VisionScope, VisionPending, VisionMutationOperation, VisionRecord, VisionModel, VisionNormalityModel, VisionRuntime, VisionDataset, VisionRun,
-  VisionInferenceAsset, VisionInference, VisionCapabilities, VisionApproval, VisionBudget, DetectionManifest, CreateVisionRunRequest, VisionFeedback,
+  VisionInferenceAsset, VisionInference, VisionCapabilities, VisionApproval, VisionBudget, DetectionManifest, CreateVisionRunRequest, VisionTrainingProposal, VisionTrainingPreflight, VisionFeedback,
   VisionFeedbackClassification, NormalityFeedback, NormalityFeedbackClassification, NormalityFollowupImport, NormalityFollowupWorkOrder, NormalityFollowupList, NormalityFollowupAnnotations, VisionTttCapabilities, VisionTttFailure, VisionTttBudget, VisionTttReport, RegisterNormalityModelPackRequest, ApproveNormalityModelPackRequest, RegisterVisionInferenceAssetRequest, RunNormalityInferenceRequest } from '../visionModelDomain.ts';
 import type { DataPoolProjection } from '../dataPoolDomain.ts';
 import '../styles/vision-models.css';
@@ -201,7 +201,7 @@ function ScopedVisionWorkbench({ scope, projectName }: { scope: VisionScope; pro
       {tab === 'model' && <ModelForm canAct={canAct} execute={execute} />}
       {tab === 'dataset' && <>{poolId ? <><PoolDatasetForm key={`${poolId}:${params.get('version') ?? ''}`} scope={scope} poolId={poolId} expectedVersionId={params.get('version')} canAct={canAct} execute={execute} />
         <details className="vision-models__external"><summary>也可登记外部检测 JSON 清单</summary><DatasetForm canAct={canAct} execute={execute} /></details></> : <DatasetForm canAct={canAct} execute={execute} />}</>}
-      {tab === 'run' && <TrainingForm canAct={canAct} execute={execute} runtimes={runtimes} datasets={datasets} models={models.filter(item => item.task_type !== 'normality')} feedback={feedback} activeRun={runs.some(run => ['QUEUED', 'RUNNING'].includes(run.status))} />}
+      {tab === 'run' && <TrainingForm scope={scope} canAct={canAct} execute={execute} runtimes={runtimes} datasets={datasets} models={models.filter(item => item.task_type !== 'normality')} feedback={feedback} activeRun={runs.some(run => ['QUEUED', 'RUNNING'].includes(run.status))} />}
       {tab === 'normality' && <NormalityWorkbench scope={scope} tttAvailable={capabilities?.ttt_status === 'NORMALITY_EPISODIC_AVAILABLE'} canAct={canAct} execute={execute} models={normalityModels} runtimes={runtimes} assets={inferenceAssets} />}
     </div><div className="vision-models__records"><h3>{tabs.find(item => item.id === tab)?.title}记录</h3>
       {!records.length && <Empty>{fresh ? '当前项目还没有记录。登记完成后才能在下一阶段选择。' : '尚未读取到可验证记录；不会显示虚构样例。'}</Empty>}
@@ -453,7 +453,47 @@ function PoolDatasetForm({ scope, poolId, expectedVersionId, canAct, execute }: 
   </form>;
 }
 
-function TrainingForm({ canAct, execute, runtimes, datasets, models, feedback, activeRun }: { canAct: boolean; execute: Execute; runtimes: VisionRuntime[]; datasets: VisionDataset[]; models: VisionModel[]; feedback: VisionFeedback[]; activeRun: boolean }) {
+function TrainingPreflightActions({ scope, sessionGeneration, proposal, formReady, onLaunch, children }: {
+  scope: VisionScope; sessionGeneration: number; proposal: VisionTrainingProposal | null; formReady: boolean;
+  onLaunch: (proposal: VisionTrainingProposal) => void; children: ReactNode;
+}) {
+  const [receipt, setReceipt] = useState<VisionTrainingPreflight>();
+  const [checking, setChecking] = useState(false), [failed, setFailed] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  useEffect(() => () => request.current?.abort(), []);
+  const currentSession = () => getIdentitySessionSnapshot().generation === sessionGeneration;
+  async function preview() {
+    if (!proposal || request.current || !currentSession()) return;
+    const active = new AbortController(); request.current = active;
+    setReceipt(undefined); setFailed(false); setChecking(true);
+    try {
+      const result = await previewVisionTraining(scope, proposal, active.signal);
+      if (!active.signal.aborted && currentSession()) setReceipt(result);
+    } catch {
+      if (!active.signal.aborted && currentSession()) setFailed(true);
+    } finally {
+      if (request.current === active) request.current = null;
+      if (!active.signal.aborted && currentSession()) setChecking(false);
+    }
+  }
+  return <>
+    <div className={receipt ? 'vision-models__notice' : 'vision-models__inline-hold'} role="status">
+      <strong>{receipt ? '预检已核验 · 等待人工授权' : checking ? '正在核验当前训练草稿…' : '当前草稿需要预检'}</strong>
+      {receipt ? <><span>冻结数据：train {receipt.dataset.split_counts.train} / val {receipt.dataset.split_counts.val} / test {receipt.dataset.split_counts.test}。没有创建训练任务，也没有运行训练或评测。</span>
+        <Sha label="预检回执 SHA-256" value={receipt.receipt_sha256} /></> : <p>更改数据、运行环境、权重、反馈或预算后，必须重新预检。</p>}
+    </div>
+    {failed && <p className="vision-models__inline-hold" role="alert">预检未通过，训练未启动。请核对当前冻结数据、权重及预算后再试。</p>}
+    <button type="button" disabled={!proposal || checking} onClick={() => void preview()}>运行预检（不启动训练）</button>
+    {children}
+    <button type="button" disabled={!receipt || !formReady || checking} onClick={() => {
+      if (!receipt || !proposal || !formReady || checking || !currentSession()) return;
+      setReceipt(undefined);
+      onLaunch(proposal);
+    }}>按本次授权启动 CPU 训练</button>
+  </>;
+}
+
+function TrainingForm({ scope, canAct, execute, runtimes, datasets, models, feedback, activeRun }: { scope: VisionScope; canAct: boolean; execute: Execute; runtimes: VisionRuntime[]; datasets: VisionDataset[]; models: VisionModel[]; feedback: VisionFeedback[]; activeRun: boolean }) {
   const [runtimeId, setRuntimeId] = useState(''), [datasetId, setDatasetId] = useState(''), [modelId, setModelId] = useState('');
   const [initialization, setInitialization] = useState<'ARCHITECTURE_RANDOM' | 'REGISTERED_WEIGHTS'>('ARCHITECTURE_RANDOM');
   const [budget, setBudget] = useState<VisionBudget>({ epochs: 1, imgsz: 64, batch: 2, seed: 0, max_seconds: 120, threads: 2 });
@@ -461,25 +501,38 @@ function TrainingForm({ canAct, execute, runtimes, datasets, models, feedback, a
   const [trainingAuthorized, setTrainingAuthorized] = useState(false), [runtimeTrusted, setRuntimeTrusted] = useState(false);
   const [weightsTrusted, setWeightsTrusted] = useState(false), [pickleAuthorized, setPickleAuthorized] = useState(false), [license, setLicense] = useState(false);
   const [feedbackIds, setFeedbackIds] = useState<string[]>([]);
+  const { generation } = useSyncExternalStore(subscribeIdentitySession, getIdentitySessionSnapshot);
   const runtime = runtimes.find(item => item.runtime_id === runtimeId), dataset = datasets.find(item => item.dataset_id === datasetId), model = models.find(item => item.model_id === modelId);
   useEffect(() => { setTrainingAuthorized(false); setRuntimeTrusted(false); setWeightsTrusted(false); setPickleAuthorized(false); }, [runtimeId, datasetId, modelId, initialization, runtime?.receipt_sha256, dataset?.receipt_sha256, model?.receipt_sha256]);
   const suitableModel = model?.task_type === 'detect' && model.format === 'pt';
   const runtimeReady = runtime?.probe.status === 'ready' && runtime.probe.import_status !== 'FAILED';
-  const eligible = Boolean(runtimeReady && dataset && (initialization === 'ARCHITECTURE_RANDOM' || suitableModel && weightsTrusted && pickleAuthorized));
+  const warm = initialization === 'REGISTERED_WEIGHTS';
   const chosenFeedback = feedback.filter(item => feedbackIds.includes(item.feedback_id));
   const feedbackReady = chosenFeedback.length === feedbackIds.length && chosenFeedback.every(item => {
     const previous = datasets.find(row => row.dataset_id === item.dataset_id);
     return item.status === 'TRIAGED_FOR_REVIEW' && item.classification !== 'UNKNOWN' && previous && dataset && dataset.dataset_receipt_sha256 !== item.dataset_receipt_sha256
       && (!previous.pool_binding || dataset.pool_binding && dataset.pool_binding.version_id !== previous.pool_binding.version_id && dataset.pool_binding.task_id !== previous.pool_binding.task_id);
   });
-  const formReady = eligible && feedbackReady && !activeRun && trainingAuthorized && runtimeTrusted && license && approvalReady(review);
-  return <form onSubmit={event => { event.preventDefault(); if (!runtime || !dataset || !formReady) return;
-    void execute('create_training_run', key => ({ ...approval(review, key), runtime_id: runtime.runtime_id, expected_runtime_sha256: runtime.runtime_sha256, dataset_id: dataset.dataset_id,
-      expected_dataset_receipt_sha256: dataset.dataset_receipt_sha256, initialization, initial_model_id: initialization === 'REGISTERED_WEIGHTS' ? model!.model_id : null,
-      expected_weights_sha256: initialization === 'REGISTERED_WEIGHTS' ? model!.weights_sha256 : null, architecture: 'yolo26n', training: budget, adaptation: 'OFF',
+  let proposal: VisionTrainingProposal | null = null;
+  if (canAct && !activeRun && runtime && runtimeReady && dataset && feedbackReady && (!warm || suitableModel)) {
+    try {
+      proposal = validateVisionTrainingProposal({ runtime_id: runtime.runtime_id, expected_runtime_sha256: runtime.runtime_sha256,
+        dataset_id: dataset.dataset_id, expected_dataset_receipt_sha256: dataset.dataset_receipt_sha256, initialization,
+        initial_model_id: warm ? model!.model_id : null, expected_weights_sha256: warm ? model!.weights_sha256 : null, architecture: 'yolo26n',
+        training: budget, adaptation: 'OFF', responds_to_feedback_ids: feedbackIds,
+        expected_feedback_receipts: Object.fromEntries(chosenFeedback.map(item => [item.feedback_id, item.receipt_sha256])) });
+    } catch { /* Missing or out-of-bounds draft fields cannot be previewed. */ }
+  }
+  // Remount only the receipt/actions: even switching A → B → A cannot resurrect A's previous receipt or in-flight request.
+  const preflightKey = JSON.stringify([generation, proposal, runtime?.receipt_sha256, dataset?.receipt_sha256, warm ? model?.receipt_sha256 : null]);
+  const formReady = Boolean(proposal && (!warm || weightsTrusted && pickleAuthorized) && trainingAuthorized && runtimeTrusted && license && approvalReady(review));
+  const launch = (current: VisionTrainingProposal) => {
+    void execute('create_training_run', key => ({ ...approval(review, key), ...current,
       operator_attests_training_authorized: trainingAuthorized, operator_attests_trusted_runtime: runtimeTrusted,
-      operator_attests_trusted_weights: initialization === 'REGISTERED_WEIGHTS' && weightsTrusted, operator_attests_pickle_load_risk: initialization === 'REGISTERED_WEIGHTS' && pickleAuthorized,
-      ultralytics_license_acknowledged: license, responds_to_feedback_ids: feedbackIds, expected_feedback_receipts: Object.fromEntries(chosenFeedback.map(item => [item.feedback_id, item.receipt_sha256])) } as CreateVisionRunRequest)).then(() => { setTrainingAuthorized(false); setRuntimeTrusted(false); setWeightsTrusted(false); setPickleAuthorized(false); setLicense(false); }); }}>
+      operator_attests_trusted_weights: warm && weightsTrusted, operator_attests_pickle_load_risk: warm && pickleAuthorized,
+      ultralytics_license_acknowledged: license } as CreateVisionRunRequest)).then(() => { setTrainingAuthorized(false); setRuntimeTrusted(false); setWeightsTrusted(false); setPickleAuthorized(false); setLicense(false); });
+  };
+  return <form onSubmit={event => event.preventDefault()}>
     <h3>发起一次有界 CPU 训练</h3><p>仅训练 train；val 用于基线 / 候选对比，test 保留且不执行评测。关闭页面不会自动发起第二次训练。</p>
     {activeRun && <div className="vision-models__inline-hold">HOLD：当前项目有 QUEUED / RUNNING 任务。请在右侧刷新或申请取消，不并行重复启动。</div>}
     <fieldset disabled={!canAct || activeRun}><label>运行环境<select aria-label="运行环境" value={runtimeId} onChange={e => setRuntimeId(e.target.value)} required><option value="">请选择已登记环境</option>{runtimes.map(item => <option key={item.runtime_id} value={item.runtime_id}>{item.display_name} · {item.probe.status} / {item.probe.import_status}</option>)}</select></label>
@@ -499,11 +552,12 @@ function TrainingForm({ canAct, execute, runtimes, datasets, models, feedback, a
         <Check label="我确认所选权重来自可信来源，并授权加载此 SHA 对应的权重。" checked={weightsTrusted} onChange={setWeightsTrusted} />
         <Check label="我单独确认 .pt 可能包含可执行 pickle 的风险，并授权本次反序列化。登记本身不代表此授权。" checked={pickleAuthorized} onChange={setPickleAuthorized} /></>}
       <div className="vision-models__budget">{([{ key: 'epochs', label: '轮次', min: 1, max: 5 }, { key: 'imgsz', label: '图像尺寸', min: 64, max: 320, step: 32 }, { key: 'batch', label: 'Batch', min: 2, max: 8 }, { key: 'max_seconds', label: '最长秒数', min: 10, max: 600 }, { key: 'threads', label: 'CPU 线程', min: 1, max: 4 }, { key: 'seed', label: 'Seed', min: 0, max: 2147483647 }] as const).map(field => <label key={field.key}>{field.label}<input type="number" value={budget[field.key]} min={field.min} max={field.max} step={'step' in field ? field.step : 1} required onChange={e => { setBudget({ ...budget, [field.key]: e.target.valueAsNumber }); setTrainingAuthorized(false); }} /></label>)}</div>
-      <ApprovalFields value={review} onChange={setReview} />
-      <Check label="我已核查 Ultralytics AGPL-3.0 / Enterprise 许可适用性；本操作不是法律合规确认。" checked={license} onChange={setLicense} />
-      <Check label="我信任所选 Python 运行环境，并授权执行已安装的模型库。" checked={runtimeTrusted} onChange={setRuntimeTrusted} />
-      <Check label="我授权按上述数据集、初始模型与预算执行一次 CPU 监督训练；候选完成不等于精度 PASS，也不接生产。" checked={trainingAuthorized} onChange={setTrainingAuthorized} />
-      <button type="submit" disabled={!formReady}>按本次授权启动 CPU 训练</button>
+      <TrainingPreflightActions key={preflightKey} scope={scope} sessionGeneration={generation} proposal={proposal} formReady={formReady} onLaunch={launch}>
+        <ApprovalFields value={review} onChange={setReview} />
+        <Check label="我已核查 Ultralytics AGPL-3.0 / Enterprise 许可适用性；本操作不是法律合规确认。" checked={license} onChange={setLicense} />
+        <Check label="我信任所选 Python 运行环境，并授权执行已安装的模型库。" checked={runtimeTrusted} onChange={setRuntimeTrusted} />
+        <Check label="我授权按上述数据集、初始模型与预算执行一次 CPU 监督训练；候选完成不等于精度 PASS，也不接生产。" checked={trainingAuthorized} onChange={setTrainingAuthorized} />
+      </TrainingPreflightActions>
     </fieldset></form>;
 }
 

@@ -3,12 +3,66 @@ import test from 'node:test';
 import { registerHooks } from 'node:module';
 import * as domain from '../web/src/visionModelDomain.ts';
 import { scope, sha, seal, model, runtime, dataset, run, manifest, capabilities, list, operation, response, createRequest, approval, digest, poolProjection, poolDataset, feedbackFixture } from './web_vision_model_fixtures.mjs';
+import { trainingProposal, preflightReceipt } from './web_vision_model_fixtures.mjs';
 import { setIdentitySession, clearIdentitySession } from '../web/src/identitySession.ts';
 const stub = 'data:text/javascript,' + encodeURIComponent(`export class OperatorApiError extends Error { constructor(code,message,status){super(message);this.code=code;this.status=status;} } export function operatorFetch(...args){return globalThis.__visionTransport(...args);}`);
 const hooks = registerHooks({ resolve(specifier, context, next) { if ((context.parentURL?.endsWith('/data/visionModelApi.ts') || context.parentURL?.endsWith('/data/dataPoolApi.ts')) && specifier === './api') return { url: stub, shortCircuit: true }; return next(specifier, context); } });
 const api = await import('../web/src/data/visionModelApi.ts'); hooks.deregister();
 function identity(id = scope.actorId) { setIdentitySession({ user_id: id, display_name: 'Synthetic user', login_name: 'vision.test', email: null, created_at: '2026-09-13T00:00:00Z', platform_role: 'USER', status: 'ACTIVE' }, 'synthetic-token-only-never-a-real-credential-0000000000'); }
 const hold = { code: 'VISION_CONTRACT_HOLD' };
+
+test('training preflight is a read-only POST using exactly the bounded proposal and strong receipt headers', async () => {
+  identity();
+  const proposal = await trainingProposal();
+  const receipt = await preflightReceipt(proposal);
+  const signal = new AbortController().signal;
+  let calls = 0;
+  globalThis.__visionTransport = (path, init) => {
+    calls++;
+    assert.equal(path, `/v1/projects/${scope.projectId}/vision-training-preflight`);
+    assert.equal(init.method, 'POST'); assert.equal(init.signal, signal);
+    assert.deepEqual(JSON.parse(init.body), proposal);
+    return response(receipt);
+  };
+  assert.deepEqual(await api.previewVisionTraining(scope, proposal, signal), receipt);
+  await assert.rejects(api.previewVisionTraining(scope, { ...proposal, ...approval }, signal), hold);
+  await assert.rejects(api.previewVisionTraining(scope, { ...proposal, training: { ...proposal.training, epochs: NaN } }, signal), hold);
+  assert.equal(calls, 1);
+  globalThis.__visionTransport = () => response(receipt, { ETag: `W/"${receipt.receipt_sha256}"` });
+  await assert.rejects(api.previewVisionTraining(scope, proposal, signal), hold);
+});
+
+test('validly sealed old or overclaiming training preflight receipts do not authorize the draft', async () => {
+  identity();
+  const proposal = await trainingProposal();
+  const receipt = await preflightReceipt(proposal);
+  for (const changed of [
+    { ...proposal, dataset_id: 'vision_dataset_new' },
+    { ...proposal, expected_dataset_receipt_sha256: sha('f') },
+    { ...proposal, expected_runtime_sha256: sha('f') },
+    { ...proposal, training: { ...proposal.training, max_seconds: 121 } },
+    { ...proposal, initialization: 'REGISTERED_WEIGHTS', initial_model_id: 'vision_model_test', expected_weights_sha256: sha() },
+  ]) {
+    globalThis.__visionTransport = () => response(receipt);
+    await assert.rejects(api.previewVisionTraining(scope, changed), hold);
+  }
+  for (const overrides of [
+    { project_id: 'other_project' }, { run_created: true }, { runtime_executed: true }, { production_release_allowed: true },
+    { requires_operator_training_authorization: false }, { machine_write_permitted: true }, { test_evaluation: 'PASS' },
+    { training: { ...proposal.training, epochs: 2 } }, { runtime: { ...receipt.runtime, sha256: sha('f') } }, { weights: { model_id: 'vision_model_test', sha256: sha() } },
+  ]) {
+    const invalid = await preflightReceipt(proposal, overrides);
+    globalThis.__visionTransport = () => response(invalid);
+    await assert.rejects(api.previewVisionTraining(scope, proposal), hold);
+  }
+});
+
+test('training preflight rejects a response from a previous login generation even for the same actor', async () => {
+  identity();
+  const proposal = await trainingProposal(), receipt = await preflightReceipt(proposal);
+  globalThis.__visionTransport = () => { identity(); return response(receipt); };
+  await assert.rejects(api.previewVisionTraining(scope, proposal), hold);
+});
 
 test('all actual resource schemas validate with JCS, strong ETag and content SHA', async () => {
   for (const [kind, make] of Object.entries({ model, runtime, dataset, run })) { const value = await make();

@@ -141,6 +141,24 @@ export async function capabilities() { return seal({ schema_version: 'visiondata
 export async function list(items) { return seal({ schema_version: 'visiondata-gate.vision-list.v1', project_id: scope.projectId, items }); }
 export async function operation(pending, resource) { return seal({ schema_version: 'visiondata-gate.vision-operation.v1', project_id: scope.projectId, operation: pending.operation,
   request_key: pending.requestKey, resource_id: resource.resource_id, resource, auto_replayed: false }); }
+export async function trainingProposal() {
+  const { request_key, reviewer_identity, note, operator_attests_training_authorized, operator_attests_trusted_runtime,
+    operator_attests_trusted_weights, operator_attests_pickle_load_risk, ultralytics_license_acknowledged, ...proposal } = await createRequest();
+  return proposal;
+}
+export async function preflightReceipt(request, overrides = {}) {
+  const warm = request.initialization === 'REGISTERED_WEIGHTS';
+  return seal({ schema_version: 'visiondata-gate.vision-training-preflight.v1', project_id: scope.projectId,
+    status: 'READY_FOR_OPERATOR_REVIEW', inputs_sha256: await digest(request),
+    training_mode: warm ? 'SUPERVISED_DETECTION_WARM_START' : 'SUPERVISED_DETECTION_FROM_SCRATCH', architecture: 'yolo26n',
+    device: 'cpu', training: request.training, adaptation: 'OFF',
+    dataset: { id: request.dataset_id, receipt_sha256: request.expected_dataset_receipt_sha256, provenance: 'GOVERNED_DATA_POOL_V1',
+      split_counts: { train: 1, val: 1, test: 1 }, class_count: 1 },
+    runtime: { id: request.runtime_id, sha256: request.expected_runtime_sha256 },
+    weights: warm ? { model_id: request.initial_model_id, sha256: request.expected_weights_sha256 } : null,
+    requires_operator_training_authorization: true, requires_weight_load_authorization: warm, self_supervised_pretraining_supported: false,
+    run_created: false, runtime_executed: false, test_evaluation: 'NOT_RUN', production_release_allowed: false, machine_write_permitted: false, ...overrides });
+}
 export function response(value, headers = {}) { return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json', ETag: `"${value.receipt_sha256}"`, 'X-Content-SHA256': value.receipt_sha256, 'Cache-Control': 'private, no-store', ...headers } }); }
 export async function poolProjection() {
   const members = manifest().samples.map(sample => ({ sample_id: sample.sample_id, source_task_id: 'task_pool_test', split: sample.split, category: 'defect', annotation_requirement: 'REQUIRED',

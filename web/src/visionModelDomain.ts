@@ -217,13 +217,27 @@ export interface RegisterPoolDatasetRequest extends VisionApproval {
   pool_id: string; version_id: string; expected_pool_receipt_sha256: string; expected_version_receipt_sha256: string;
   class_names: string[]; groups: Record<string, string>; normal_sample_ids: string[]; operator_attests_data_authorized: true;
 }
-export interface CreateVisionRunRequest extends VisionApproval {
+export interface VisionTrainingProposal {
   runtime_id: string; expected_runtime_sha256: string; dataset_id: string; expected_dataset_receipt_sha256: string;
   initialization: 'ARCHITECTURE_RANDOM' | 'REGISTERED_WEIGHTS'; initial_model_id: string | null; expected_weights_sha256: string | null;
-  architecture: 'yolo26n'; training: VisionBudget; adaptation: 'OFF'; operator_attests_training_authorized: true;
+  architecture: 'yolo26n'; training: VisionBudget; adaptation: 'OFF';
+  responds_to_feedback_ids: string[]; expected_feedback_receipts: Record<string, string>;
+}
+export interface CreateVisionRunRequest extends VisionApproval, VisionTrainingProposal {
+  operator_attests_training_authorized: true;
   operator_attests_trusted_runtime: true; operator_attests_trusted_weights: boolean; operator_attests_pickle_load_risk: boolean;
   ultralytics_license_acknowledged: true;
-  responds_to_feedback_ids: string[]; expected_feedback_receipts: Record<string, string>;
+}
+export interface VisionTrainingPreflight {
+  schema_version: 'visiondata-gate.vision-training-preflight.v1'; project_id: string; status: 'READY_FOR_OPERATOR_REVIEW';
+  inputs_sha256: string; receipt_sha256: string;
+  training_mode: 'SUPERVISED_DETECTION_FROM_SCRATCH' | 'SUPERVISED_DETECTION_WARM_START';
+  architecture: 'yolo26n'; device: 'cpu'; training: VisionBudget; adaptation: 'OFF';
+  dataset: { id: string; receipt_sha256: string; provenance: 'GOVERNED_DATA_POOL_V1' | 'UNBOUND_EXTERNAL_FIXTURE';
+    split_counts: Record<'train' | 'val' | 'test', number>; class_count: number };
+  runtime: { id: string; sha256: string }; weights: { model_id: string; sha256: string } | null;
+  requires_operator_training_authorization: true; requires_weight_load_authorization: boolean; self_supervised_pretraining_supported: false;
+  run_created: false; runtime_executed: false; test_evaluation: 'NOT_RUN'; production_release_allowed: false; machine_write_permitted: false;
 }
 export interface VisionRunActionRequest extends VisionApproval { expected_run_sha256: string; operator_attests_reviewed: true }
 export interface SelectVisionRequest extends VisionRunActionRequest { action: 'APPROVE_SANDBOX' | 'REJECT'; expected_candidate_weights_sha256: string }
@@ -283,6 +297,50 @@ export async function verifyVisionSeal(value: unknown, etag?: string | null, con
   if (etag !== undefined) visionEnsure(etag === `"${object.receipt_sha256}"`);
   if (contentSha !== undefined) visionEnsure(contentSha === object.receipt_sha256);
   return object;
+}
+const trainingProposalKeys = ['runtime_id', 'expected_runtime_sha256', 'dataset_id', 'expected_dataset_receipt_sha256',
+  'initialization', 'initial_model_id', 'expected_weights_sha256', 'architecture', 'training', 'adaptation',
+  'responds_to_feedback_ids', 'expected_feedback_receipts'];
+function validateTrainingProposalFields(v: Record<string, unknown>): void {
+  visionId(v.runtime_id); visionId(v.dataset_id); visionSha(v.expected_runtime_sha256); visionSha(v.expected_dataset_receipt_sha256); validateVisionBudget(v.training);
+  visionEnsure(v.architecture === 'yolo26n' && v.adaptation === 'OFF');
+  visionEnsure(Array.isArray(v.responds_to_feedback_ids) && v.responds_to_feedback_ids.length <= 64 && new Set(v.responds_to_feedback_ids).size === v.responds_to_feedback_ids.length);
+  const feedback = visionObject(v.expected_feedback_receipts); visionEnsure(Object.keys(feedback).length === v.responds_to_feedback_ids.length);
+  for (const id of v.responds_to_feedback_ids) { visionEnsure(typeof id === 'string' && /^vfeedback_[0-9a-f]{24}$/.test(id)); visionSha(feedback[id]); }
+  if (v.initialization === 'REGISTERED_WEIGHTS') { visionId(v.initial_model_id); visionSha(v.expected_weights_sha256); }
+  else visionEnsure(v.initialization === 'ARCHITECTURE_RANDOM' && v.initial_model_id === null && v.expected_weights_sha256 === null);
+}
+export function validateVisionTrainingProposal(value: unknown): VisionTrainingProposal {
+  const v = visionObject(value); fields(v, trainingProposalKeys); validateTrainingProposalFields(v);
+  return v as unknown as VisionTrainingProposal;
+}
+export async function validateVisionTrainingPreflight(value: unknown, scope: VisionScope, proposal: VisionTrainingProposal, etag: string | null, contentSha: string | null): Promise<VisionTrainingPreflight> {
+  validateVisionScope(scope);
+  const v = await verifyVisionSeal(value, etag, contentSha);
+  fields(v, ['schema_version', 'project_id', 'status', 'inputs_sha256', 'training_mode', 'architecture', 'device', 'training', 'adaptation',
+    'dataset', 'runtime', 'weights', 'requires_operator_training_authorization', 'requires_weight_load_authorization',
+    'self_supervised_pretraining_supported', 'run_created', 'runtime_executed', 'test_evaluation', 'production_release_allowed', 'machine_write_permitted', 'receipt_sha256']);
+  const warm = proposal.initialization === 'REGISTERED_WEIGHTS';
+  visionEnsure(v.schema_version === 'visiondata-gate.vision-training-preflight.v1' && v.project_id === scope.projectId && v.status === 'READY_FOR_OPERATOR_REVIEW');
+  visionEnsure(v.inputs_sha256 === await visionDigest(proposal) && v.architecture === proposal.architecture && v.device === 'cpu' && v.adaptation === 'OFF');
+  visionEnsure(v.training_mode === (warm ? 'SUPERVISED_DETECTION_WARM_START' : 'SUPERVISED_DETECTION_FROM_SCRATCH'));
+  visionEnsure(canonicalizeJcs(validateVisionBudget(v.training)) === canonicalizeJcs(proposal.training));
+  const dataset = visionObject(v.dataset); fields(dataset, ['id', 'receipt_sha256', 'provenance', 'split_counts', 'class_count']);
+  visionEnsure(dataset.id === proposal.dataset_id && dataset.receipt_sha256 === proposal.expected_dataset_receipt_sha256);
+  visionEnsure(dataset.provenance === 'GOVERNED_DATA_POOL_V1' || dataset.provenance === 'UNBOUND_EXTERNAL_FIXTURE');
+  const counts = visionObject(dataset.split_counts); fields(counts, ['train', 'val', 'test']);
+  for (const count of Object.values(counts)) integer(count, 1, Number.MAX_SAFE_INTEGER);
+  integer(dataset.class_count, 1, 64);
+  const runtime = visionObject(v.runtime); fields(runtime, ['id', 'sha256']);
+  visionEnsure(runtime.id === proposal.runtime_id && runtime.sha256 === proposal.expected_runtime_sha256);
+  if (warm) {
+    const weights = visionObject(v.weights); fields(weights, ['model_id', 'sha256']);
+    visionEnsure(weights.model_id === proposal.initial_model_id && weights.sha256 === proposal.expected_weights_sha256);
+  } else visionEnsure(v.weights === null);
+  visionEnsure(v.requires_operator_training_authorization === true && v.requires_weight_load_authorization === warm
+    && v.self_supervised_pretraining_supported === false && v.run_created === false && v.runtime_executed === false
+    && v.test_evaluation === 'NOT_RUN' && v.production_release_allowed === false && v.machine_write_permitted === false);
+  return v as unknown as VisionTrainingPreflight;
 }
 export function validateVisionBudget(value: unknown): VisionBudget {
   const v = visionObject(value); fields(v, ['epochs', 'imgsz', 'batch', 'seed', 'max_seconds', 'threads']);
@@ -579,15 +637,11 @@ export async function validateVisionRequest(operation: VisionMutationOperation, 
     v.normal_sample_ids.forEach(sampleId => { visionId(sampleId); visionEnsure(Object.hasOwn(groups, sampleId)); });
     visionEnsure(v.operator_attests_data_authorized === true);
   } else if (name === 'create_training_run') {
-    fields(v, [...common, 'runtime_id', 'expected_runtime_sha256', 'dataset_id', 'expected_dataset_receipt_sha256', 'initialization', 'initial_model_id', 'expected_weights_sha256', 'architecture', 'training', 'operator_attests_training_authorized', 'operator_attests_trusted_runtime', 'operator_attests_trusted_weights', 'operator_attests_pickle_load_risk', 'ultralytics_license_acknowledged', 'adaptation', 'responds_to_feedback_ids', 'expected_feedback_receipts']);
-    visionId(v.runtime_id); visionId(v.dataset_id); visionSha(v.expected_runtime_sha256); visionSha(v.expected_dataset_receipt_sha256); validateVisionBudget(v.training);
-    visionEnsure(v.architecture === 'yolo26n' && v.adaptation === 'OFF' && v.operator_attests_training_authorized === true && v.operator_attests_trusted_runtime === true && v.ultralytics_license_acknowledged === true);
+    fields(v, [...common, ...trainingProposalKeys, 'operator_attests_training_authorized', 'operator_attests_trusted_runtime', 'operator_attests_trusted_weights', 'operator_attests_pickle_load_risk', 'ultralytics_license_acknowledged']);
+    validateTrainingProposalFields(v);
+    visionEnsure(v.operator_attests_training_authorized === true && v.operator_attests_trusted_runtime === true && v.ultralytics_license_acknowledged === true);
     visionEnsure(typeof v.operator_attests_trusted_weights === 'boolean' && typeof v.operator_attests_pickle_load_risk === 'boolean');
-    visionEnsure(Array.isArray(v.responds_to_feedback_ids) && v.responds_to_feedback_ids.length <= 64 && new Set(v.responds_to_feedback_ids).size === v.responds_to_feedback_ids.length);
-    const feedback = visionObject(v.expected_feedback_receipts); visionEnsure(Object.keys(feedback).length === v.responds_to_feedback_ids.length);
-    for (const identifier of v.responds_to_feedback_ids) { visionEnsure(typeof identifier === 'string' && /^vfeedback_[0-9a-f]{24}$/.test(identifier)); visionSha(feedback[identifier]); }
-    if (v.initialization === 'REGISTERED_WEIGHTS') { visionId(v.initial_model_id); visionSha(v.expected_weights_sha256); visionEnsure(v.operator_attests_trusted_weights === true && v.operator_attests_pickle_load_risk === true); }
-    else visionEnsure(v.initialization === 'ARCHITECTURE_RANDOM' && v.initial_model_id === null && v.expected_weights_sha256 === null);
+    if (v.initialization === 'REGISTERED_WEIGHTS') visionEnsure(v.operator_attests_trusted_weights === true && v.operator_attests_pickle_load_risk === true);
   } else {
     fields(v, [...common, 'expected_run_sha256', 'operator_attests_reviewed', ...(name === 'selection' ? ['action', 'expected_candidate_weights_sha256'] : name === 'triage_feedback' ? ['expected_feedback_sha256', 'classification'] : [])]);
     visionSha(v.expected_run_sha256); visionEnsure(v.operator_attests_reviewed === true);

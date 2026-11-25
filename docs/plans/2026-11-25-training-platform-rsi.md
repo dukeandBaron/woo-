@@ -24,10 +24,17 @@ Target: **100 evidence-backed engineering iterations**. Count one round only whe
 - Surrounding regression: `test_vision_training_lifecycle.py`, `test_learning_detection_dataset.py` and `test_vision_feedback_lifecycle.py` reported 121 passed, 1 skipped (Windows host does not permit creating a symlink). This is not a full-repository test. The warm-start preflight case is present in both runs.
 - The published training-launch request's fields, default values, constraints and required fields were verified unchanged. No live trainer, external runtime, GPU, self-supervised pretraining, independent test-set evaluation or production deployment was run in this round.
 
+## R002: Require a fresh workbench preflight before human-authorized submission
+
+- Baseline: `144601dd` supported read-only backend preflight, but the workbench could submit without it. Three contract tests failed for the missing client operation and the Edge test failed for the missing preview button.
+- Validate the exact proposal and strong response seal in the TypeScript client. Compare the project, proposal digest, budget and registered data/runtime/weight identities. Reject contradictory execution/release/authorization claims.
+- Keep the receipt in the current draft only. A change of inputs, a resource refresh, or a new login generation discards the previous receipt; returning to the old draft does not revive old requests. No write lock or saved browser receipt is introduced by preview.
+- Green: 20/20 Node vision contract tests and 26/26 full Edge visual-model workbench tests (synthetic transport, real forms); TypeScript checks and Vite production build passed. Tests exercise data/weights/budget invalidation, delayed responses, failure, and the unchanged separate human authorization.
+- Scope: the workbench is gated; the existing backend launch API still enforces its own checks and human grants. No live training was launched.
+
 ## Next gates (proposed, not counted)
 
-1. Workbench: show frozen-data/weight/budget readiness before the operator sees the launch action.
-2. Recipe design: separate supervised-from-scratch, supervised warm-start and self-supervised pretraining. Specify data/holdouts, objective, checkpoint provenance and baseline. An unimplemented recipe must fail closed before scheduling.
-3. Data: measure annotation import/export and dataset build times on fixed licensed workloads; verify split isolation and per-class availability. Add caching only when one benchmark identifies a bottleneck.
-4. Training adapters: prove one tiny local acceptance per permitted route before considering GPU/distributed support. Record hardware, time/storage budget and recovery.
-5. Evaluation and iteration: compare frozen holdouts and errors at a fixed operating policy, with human approval for changes. Preserve failures and never use a training completion event as release authority.
+1. Recipe design: separate supervised-from-scratch, supervised warm-start and self-supervised pretraining. Specify data/holdouts, objective, checkpoint provenance and baseline. An unimplemented recipe must fail closed before scheduling.
+2. Data: measure annotation import/export and dataset build times on fixed licensed workloads; verify split isolation and per-class availability. Add caching only when one benchmark identifies a bottleneck.
+3. Training adapters: prove one tiny local acceptance per permitted route before considering GPU/distributed support. Record hardware, time/storage budget and recovery.
+4. Evaluation and iteration: compare frozen holdouts and errors at a fixed operating policy, with human approval for changes. Preserve failures and never use a training completion event as release authority.
