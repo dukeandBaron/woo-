@@ -21,6 +21,7 @@ Provider 配置分离，也不把“可执行训练”写成“工业模型已�
 | 模型登记 | `GET/POST /vision-models` | 流式核对权重 SHA、任务类型、来源和许可声明；登记时不反序列化 `.pt` | 已加载、已验证安全或允许生产 |
 | 外部运行环境 | `GET/POST /vision-runtimes`、`POST /vision-runtimes/{id}/probe` | 绑定解释器 SHA 与 runtime fingerprint；显式 `import_check=true` 才执行库导入／CPU probe | 自动安装依赖或云端算力已连接 |
 | 检测数据集 | `GET/POST /vision-datasets`、`POST /vision-datasets/from-data-pool` | 冻结 train／val／test、BBox、采集组、图像和标注版本 | 自动生成标签、Mask 或把 val/test 回灌 train |
+| 训练方案预检 | `POST /vision-training-preflight` | 只读复核训练方案中的冻结数据集、运行时、可选权重和预算，返回摘要回执 | 人工已批准、已入队、已加载权重或已运行训练 |
 | 训练任务 | `GET/POST /vision-training-runs`、cancel／recover／selection | 单次有界 CPU detect；保存运行、checkpoint 与人工选择状态 | GPU 已运行、自动重试或生产发布 |
 | 验证反馈 | `GET /vision-training-runs/{id}/feedback`、triage | FP/FN 只生成复核候选；具名人员分类后可显式关联下一轮 | 模型分歧自动证明标签错误 |
 
@@ -38,6 +39,24 @@ Provider 配置分离，也不把“可执行训练”写成“工业模型已�
 - 图像、标签、框、类别、尺寸或冻结回执发生漂移。
 
 这不是近重复／连续帧语义判定器，也不会自动删除被拒绝样本。
+
+## 只读训练方案预检
+
+预检与训练启动分开。将已登记的 `runtime_id`、`expected_runtime_sha256`、
+`dataset_id`、`expected_dataset_receipt_sha256`、`initialization` 和可选的
+`training` 提交到 `POST /vision-training-preflight`。热启动还须提供
+`initial_model_id` 与 `expected_weights_sha256`。预检不接收具名审批字段或授权
+布尔值，不创建运行、候选模型或幂等写回执，也不启动解释器。
+
+响应 `READY_FOR_OPERATOR_REVIEW` 表示这些输入在检查时匹配当前登记和冻结工件。
+回执包含数据划分计数、规范化预算、初始化方式和训练／权重加载仍需授权的标志。
+两种方式是随机初始化的监督检测（`SUPERVISED_DETECTION_FROM_SCRATCH`）
+和使用已登记权重的监督检测（`SUPERVISED_DETECTION_WARM_START`）。
+二者都不是自监督预训练；test 仍为 `NOT_RUN`。
+
+通过预检不等于可以立即排队、已测过资源占用或已经运行独立评估。正式创建训练
+任务仍单独要求人授权并复核工件；其他运行正在执行或后续输入漂移可以继续阻断。
+规划参考：[训练平台迭代计划](plans/2026-11-25-training-platform-rsi.md)。
 
 ## 有界 YOLO 训练
 

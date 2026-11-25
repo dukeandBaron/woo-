@@ -154,7 +154,10 @@ class RegisterPoolDetectionDataset(VisionRequest):
     operator_attests_data_authorized: Literal[True]
 
 
-class CreateVisionTrainingRun(VisionRequest):
+class VisionTrainingPlanInputs(BaseModel):
+    """A bounded training proposal, with no authority to run or load a model."""
+
+    model_config = VisionRequest.model_config
     runtime_id: str = Field(pattern=OPAQUE)
     expected_runtime_sha256: str = Field(pattern=SHA)
     dataset_id: str = Field(pattern=OPAQUE)
@@ -164,11 +167,6 @@ class CreateVisionTrainingRun(VisionRequest):
     expected_weights_sha256: str | None = Field(default=None, pattern=SHA)
     architecture: Literal["yolo26n"] = "yolo26n"
     training: VisionTrainingBudget = Field(default_factory=VisionTrainingBudget)
-    operator_attests_training_authorized: Literal[True]
-    operator_attests_trusted_runtime: Literal[True]
-    operator_attests_trusted_weights: bool = False
-    operator_attests_pickle_load_risk: bool = False
-    ultralytics_license_acknowledged: Literal[True]
     adaptation: Literal["OFF"] = "OFF"
     responds_to_feedback_ids: list[str] = Field(default_factory=list, max_length=64)
     expected_feedback_receipts: dict[str, str] = Field(
@@ -176,7 +174,7 @@ class CreateVisionTrainingRun(VisionRequest):
     )
 
     @model_validator(mode="after")
-    def require_loading_authority(self):
+    def require_consistent_training_inputs(self):
         if len(set(self.responds_to_feedback_ids)) != len(
             self.responds_to_feedback_ids
         ) or set(self.responds_to_feedback_ids) != set(self.expected_feedback_receipts):
@@ -194,20 +192,34 @@ class CreateVisionTrainingRun(VisionRequest):
         ):
             raise ValueError("invalid visual feedback digest")
         if self.initialization == "REGISTERED_WEIGHTS":
-            if not (
-                self.initial_model_id
-                and self.expected_weights_sha256
-                and self.operator_attests_trusted_weights
-                and self.operator_attests_pickle_load_risk
-            ):
+            if not (self.initial_model_id and self.expected_weights_sha256):
                 raise ValueError(
-                    "registered weights require separate named trusted pickle-load authority"
+                    "registered weights require a model ID and expected weights digest"
                 )
         elif (
             self.initial_model_id is not None
             or self.expected_weights_sha256 is not None
         ):
             raise ValueError("random initialization cannot silently load a checkpoint")
+        return self
+
+
+class CreateVisionTrainingRun(VisionRequest, VisionTrainingPlanInputs):
+    operator_attests_training_authorized: Literal[True]
+    operator_attests_trusted_runtime: Literal[True]
+    operator_attests_trusted_weights: bool = False
+    operator_attests_pickle_load_risk: bool = False
+    ultralytics_license_acknowledged: Literal[True]
+
+    @model_validator(mode="after")
+    def require_loading_authority(self):
+        if self.initialization == "REGISTERED_WEIGHTS" and not (
+            self.operator_attests_trusted_weights
+            and self.operator_attests_pickle_load_risk
+        ):
+            raise ValueError(
+                "registered weights require separate named trusted pickle-load authority"
+            )
         return self
 
 
@@ -2084,9 +2096,129 @@ class LocalVisionModelService:
                 ):
                     raise VisionModelError("FEEDBACK_REQUIRES_NEW_POOL_AND_GATE")
 
-    def create_training_run(self, actor, project, request: CreateVisionTrainingRun):
+    def _verify_training_plan_inputs(
+        self, actor, project, request: VisionTrainingPlanInputs
+    ) -> tuple[dict, dict, dict]:
+        """Verify current registration and artifact bytes; never start a worker."""
         from .learning_detection_dataset import verify_detection_dataset
 
+        with self.product.store._connection() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            self._membership(conn, actor, project)
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vision_records'"
+            ).fetchone() is None:
+                raise NotFoundError("visual resource unavailable")
+            if self.root.is_symlink() or self.root.is_junction():
+                raise VisionModelError("REGISTRY_ROOT_LINK_FORBIDDEN")
+            runtime, runtime_private = self._read(
+                conn, project, request.runtime_id, "runtime"
+            )
+            dataset, dataset_private = self._read(
+                conn, project, request.dataset_id, "dataset"
+            )
+            model, model_private = (
+                self._read(conn, project, request.initial_model_id, "model")
+                if request.initial_model_id
+                else (None, {})
+            )
+            self._feedback_inputs(conn, project, request, dataset)
+        self._require_governed_training_dataset(dataset, dataset_private)
+        if runtime["runtime_sha256"] != request.expected_runtime_sha256:
+            raise VisionModelError("STALE_RUNTIME")
+        if runtime["probe"].get("status") != "ready":
+            raise VisionModelError("RUNTIME_UNAVAILABLE")
+        if (
+            dataset["dataset_receipt_sha256"]
+            != request.expected_dataset_receipt_sha256
+        ):
+            raise VisionModelError("STALE_DATASET")
+        self._verify_dataset_source(actor, project, dataset_private)
+        frozen_dataset = verify_detection_dataset(
+            Path(dataset_private["dataset_root"]),
+            request.expected_dataset_receipt_sha256,
+        )
+        _file(
+            runtime_private["executable_path"],
+            runtime["executable_sha256"],
+            "RUNTIME_CHANGED",
+        )
+        if model is not None:
+            if model["task_type"] != "detect" or model["format"] != "pt":
+                raise VisionModelError("YOLO_DETECTION_CHECKPOINT_REQUIRED")
+            if model["weights_sha256"] != request.expected_weights_sha256:
+                raise VisionModelError("STALE_WEIGHTS")
+            if model["license_id"].upper() in {"UNKNOWN", "UNSPECIFIED", "NONE"}:
+                raise VisionModelError("WEIGHTS_LICENSE_UNRESOLVED")
+            _file(
+                model_private["weights_path"],
+                request.expected_weights_sha256,
+                "WEIGHTS_CHANGED",
+            )
+        return dataset, frozen_dataset, {
+            "runtime": runtime,
+            "runtime_private": runtime_private,
+            "dataset_private": dataset_private,
+            "model_private": model_private,
+        }
+
+    def preview_training_plan(
+        self, actor, project, request: VisionTrainingPlanInputs
+    ) -> dict:
+        request = VisionTrainingPlanInputs.model_validate(request.model_dump(mode="json"))
+        try:
+            dataset, frozen, _private = self._verify_training_plan_inputs(
+                actor, project, request
+            )
+            warm_start = request.initialization == "REGISTERED_WEIGHTS"
+            return _seal(
+                {
+                    "schema_version": "visiondata-gate.vision-training-preflight.v1",
+                    "project_id": project,
+                    "status": "READY_FOR_OPERATOR_REVIEW",
+                    "inputs_sha256": _sha(request.model_dump(mode="json")),
+                    "training_mode": (
+                        "SUPERVISED_DETECTION_WARM_START"
+                        if warm_start
+                        else "SUPERVISED_DETECTION_FROM_SCRATCH"
+                    ),
+                    "architecture": request.architecture,
+                    "device": "cpu",
+                    "training": request.training.model_dump(mode="json"),
+                    "adaptation": request.adaptation,
+                    "dataset": {
+                        "id": request.dataset_id,
+                        "receipt_sha256": request.expected_dataset_receipt_sha256,
+                        "provenance": dataset["provenance"],
+                        "split_counts": frozen["split_counts"],
+                        "class_count": len(frozen["class_names"]),
+                    },
+                    "runtime": {
+                        "id": request.runtime_id,
+                        "sha256": request.expected_runtime_sha256,
+                    },
+                    "weights": (
+                        {
+                            "model_id": request.initial_model_id,
+                            "sha256": request.expected_weights_sha256,
+                        }
+                        if warm_start
+                        else None
+                    ),
+                    "requires_operator_training_authorization": True,
+                    "requires_weight_load_authorization": warm_start,
+                    "self_supervised_pretraining_supported": False,
+                    "run_created": False,
+                    "runtime_executed": False,
+                    "test_evaluation": "NOT_RUN",
+                    "production_release_allowed": False,
+                    "machine_write_permitted": False,
+                }
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            raise VisionModelError("VISION_INPUT_OR_RUNTIME_CONTRACT_INVALID") from None
+
+    def create_training_run(self, actor, project, request: CreateVisionTrainingRun):
         request = CreateVisionTrainingRun.model_validate(
             request.model_dump(mode="json")
         )
@@ -2100,51 +2232,9 @@ class LocalVisionModelService:
                     )
                 self._require_governed_training_dataset(dataset, dataset_private)
                 return existing
-            with self.product.store._connection() as conn:
-                runtime, runtime_private = self._read(
-                    conn, project, request.runtime_id, "runtime"
-                )
-                dataset, dataset_private = self._read(
-                    conn, project, request.dataset_id, "dataset"
-                )
-                model, model_private = (
-                    self._read(conn, project, request.initial_model_id, "model")
-                    if request.initial_model_id
-                    else (None, {})
-                )
-                self._feedback_inputs(conn, project, request, dataset)
-            self._require_governed_training_dataset(dataset, dataset_private)
-            if runtime["runtime_sha256"] != request.expected_runtime_sha256:
-                raise VisionModelError("STALE_RUNTIME")
-            if runtime["probe"].get("status") != "ready":
-                raise VisionModelError("RUNTIME_UNAVAILABLE")
-            if (
-                dataset["dataset_receipt_sha256"]
-                != request.expected_dataset_receipt_sha256
-            ):
-                raise VisionModelError("STALE_DATASET")
-            self._verify_dataset_source(actor, project, dataset_private)
-            verify_detection_dataset(
-                Path(dataset_private["dataset_root"]),
-                request.expected_dataset_receipt_sha256,
+            dataset, _frozen_dataset, private = self._verify_training_plan_inputs(
+                actor, project, request
             )
-            _file(
-                runtime_private["executable_path"],
-                runtime["executable_sha256"],
-                "RUNTIME_CHANGED",
-            )
-            if model is not None:
-                if model["task_type"] != "detect" or model["format"] != "pt":
-                    raise VisionModelError("YOLO_DETECTION_CHECKPOINT_REQUIRED")
-                if model["weights_sha256"] != request.expected_weights_sha256:
-                    raise VisionModelError("STALE_WEIGHTS")
-                if model["license_id"].upper() in {"UNKNOWN", "UNSPECIFIED", "NONE"}:
-                    raise VisionModelError("WEIGHTS_LICENSE_UNRESOLVED")
-                _file(
-                    model_private["weights_path"],
-                    request.expected_weights_sha256,
-                    "WEIGHTS_CHANGED",
-                )
             value = self._base(project, "vision_run", actor, request)
             value.update(
                 run_id=value["resource_id"],
@@ -2171,15 +2261,11 @@ class LocalVisionModelService:
                 feedback_ids=[],
                 feedback_status="NOT_EVALUATED",
             )
-            private = {
-                "runtime": runtime,
-                "runtime_private": runtime_private,
-                "dataset_private": dataset_private,
-                "model_private": model_private,
-                "request": request.model_dump(mode="json"),
-            }
+            private["request"] = request.model_dump(mode="json")
             with self.product.store._connection(immediate=True) as conn:
-                self._verify_pool_transaction(conn, actor, project, dataset_private)
+                self._verify_pool_transaction(
+                    conn, actor, project, private["dataset_private"]
+                )
                 self._feedback_inputs(conn, project, request, dataset)
                 active = conn.execute(
                     "SELECT body FROM vision_records WHERE kind='run' AND project_id=?",

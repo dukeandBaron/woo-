@@ -566,11 +566,61 @@ def test_governed_pool_dataset_enables_default_training_preflight(
         ),
     )
     pending = []
-    monkeypatch.setattr(
-        registry.threading.Thread, "start", lambda thread: pending.append(thread)
-    )
+    original_start = registry.threading.Thread.start
+
+    def capture_training_thread(thread):
+        if thread.name.startswith("vision-cpu-"):
+            pending.append(thread)
+        else:
+            original_start(thread)
+
+    monkeypatch.setattr(registry.threading.Thread, "start", capture_training_thread)
 
     capabilities = service.capabilities(ACTOR, project_id)
+    proposal = {
+        "runtime_id": runtime["runtime_id"],
+        "expected_runtime_sha256": runtime["runtime_sha256"],
+        "dataset_id": dataset["dataset_id"],
+        "expected_dataset_receipt_sha256": dataset["dataset_receipt_sha256"],
+        "initialization": "ARCHITECTURE_RANDOM",
+        "training": {"seed": 17, "max_seconds": 30},
+    }
+    with product.store._connection() as conn:
+        requests_before = conn.execute("SELECT COUNT(*) FROM vision_requests").fetchone()[0]
+    from visiondata_gate.vision_model_api import install_vision_model_routes
+
+    app = FastAPI()
+    install_vision_model_routes(app, lambda: ACTOR, lambda: product)
+    path = f"/v1/projects/{project_id}/vision-training-preflight"
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        response = client.post(path, json=proposal)
+        assert response.status_code == 200, response.text
+        preflight = response.json()
+        second = client.post(path, json=proposal)
+        assert second.status_code == 200 and second.json() == preflight
+        assert response.headers["Cache-Control"] == "private, no-store"
+        assert response.headers["X-Content-SHA256"] == preflight["receipt_sha256"]
+        stable = {key: value for key, value in preflight.items() if key != "receipt_sha256"}
+        assert hashlib.sha256(canonical_jcs_bytes(stable)).hexdigest() == preflight["receipt_sha256"]
+        bad = client.post(path, json=proposal | {"expected_runtime_sha256": "b" * 64})
+        assert bad.status_code == 409
+        assert str(runtime_path) not in bad.text + response.text
+        extra_grant = client.post(path, json=proposal | {"operator_attests_training_authorized": True})
+        assert extra_grant.status_code == 422
+    assert preflight["status"] == "READY_FOR_OPERATOR_REVIEW"
+    assert preflight["training_mode"] == "SUPERVISED_DETECTION_FROM_SCRATCH"
+    assert preflight["dataset"]["split_counts"] == {"train": 2, "val": 1, "test": 1}
+    assert preflight["training"]["seed"] == 17
+    assert preflight["training"]["max_seconds"] == 30
+    assert preflight["requires_operator_training_authorization"] is True
+    assert preflight["runtime_executed"] is False
+    assert preflight["run_created"] is False
+    assert preflight["test_evaluation"] == "NOT_RUN"
+    assert preflight["production_release_allowed"] is False
+    assert pending == []
+    with product.store._connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM vision_requests").fetchone()[0] == requests_before
+        assert conn.execute("SELECT COUNT(*) FROM vision_records WHERE kind='run'").fetchone()[0] == 0
     run = service.create_training_run(
         ACTOR,
         project_id,
@@ -578,11 +628,7 @@ def test_governed_pool_dataset_enables_default_training_preflight(
             request_key="bridge-training-launch-0001",
             reviewer_identity="Synthetic training reviewer",
             note="Queue governed detection training without executing the backend",
-            runtime_id=runtime["runtime_id"],
-            expected_runtime_sha256=runtime["runtime_sha256"],
-            dataset_id=dataset["dataset_id"],
-            expected_dataset_receipt_sha256=dataset["dataset_receipt_sha256"],
-            initialization="ARCHITECTURE_RANDOM",
+            **proposal,
             operator_attests_training_authorized=True,
             operator_attests_trusted_runtime=True,
             ultralytics_license_acknowledged=True,

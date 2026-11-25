@@ -52,6 +52,7 @@ POST_PATHS = (
     "vision-models/vision_model_missing/inferences",
     "vision-models/vision_model_missing/ttt-inferences",
     "vision-inferences/vision_inference_missing/feedback",
+    "vision-training-preflight",
     "vision-training-runs",
     "vision-training-runs/run-missing/cancel",
     "vision-training-runs/run-missing/recover",
@@ -510,6 +511,35 @@ def test_all_post_routes_reject_remote_peer_before_service_or_input_validation(
     assert response.status_code == 403
     assert response.headers["cache-control"] == "private, no-store"
     assert "synthetic-private" not in response.text
+
+
+def test_training_preflight_missing_registry_does_not_initialize_it(vision_app):
+    app, product, project_id = vision_app
+    path = f"/v1/projects/{project_id}/vision-training-preflight"
+    body = {
+        "runtime_id": "runtime_missing",
+        "expected_runtime_sha256": "a" * 64,
+        "dataset_id": "dataset_missing",
+        "expected_dataset_receipt_sha256": "b" * 64,
+        "initialization": "ARCHITECTURE_RANDOM",
+    }
+    assert not (product.product_root / "vision_models").exists()
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        missing = client.post(path, headers=OWNER_HEADERS, json=body)
+        assert missing.status_code == 404
+        assert missing.json() == {"error": "not_found"}
+        outsider = client.post(
+            path,
+            headers={"X-Test-Session": "synthetic-outsider-session"},
+            json=body,
+        )
+        assert outsider.status_code == 404
+        assert outsider.json() == missing.json()
+    assert not (product.product_root / "vision_models").exists()
+    with product.store._connection() as conn:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='vision_records'"
+        ).fetchone() is None
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"])

@@ -31,6 +31,7 @@ from .local_model_registry import (
     SelectVisionModel,
     VisionModelError,
     VisionRunAction,
+    VisionTrainingPlanInputs,
 )
 
 _PRIVATE_HEADERS = {"Cache-Control": "private, no-store"}
@@ -443,6 +444,21 @@ def install_vision_model_routes(
     ) -> dict:
         return _bind_receipt(
             LocalVisionModelService(product).register_pool_dataset(
+                actor, project_id, request
+            ),
+            response,
+        )
+
+    @router.post("/vision-training-preflight", dependencies=local_only)
+    def preview_training_plan(
+        project_id: str,
+        request: VisionTrainingPlanInputs,
+        response: Response,
+        actor: str = Depends(actor_dependency),
+        product=Depends(product_dependency),
+    ) -> dict:
+        return _bind_receipt(
+            LocalVisionModelService(product).preview_training_plan(
                 actor, project_id, request
             ),
             response,

@@ -335,6 +335,34 @@ def test_unbound_dataset_does_not_make_capabilities_training_ready(context):
     assert capabilities["training_ready"] is False
 
 
+def test_training_preflight_can_review_pinned_weight_bytes_but_not_grant_load(context):
+    model = _weights(context)
+    runtime = _runtime(context)
+    dataset = _dataset(context)
+    proposal = registry.VisionTrainingPlanInputs(
+        runtime_id=runtime["runtime_id"],
+        expected_runtime_sha256=runtime["runtime_sha256"],
+        dataset_id=dataset["dataset_id"],
+        expected_dataset_receipt_sha256=dataset["dataset_receipt_sha256"],
+        initialization="REGISTERED_WEIGHTS",
+        initial_model_id=model["model_id"],
+        expected_weights_sha256=model["weights_sha256"],
+    )
+    preview = context.service.preview_training_plan(
+        context.actor, context.project, proposal
+    )
+    assert preview["training_mode"] == "SUPERVISED_DETECTION_WARM_START"
+    assert preview["weights"]["sha256"] == model["weights_sha256"]
+    assert preview["requires_weight_load_authorization"] is True
+    assert preview["self_supervised_pretraining_supported"] is False
+    assert context.pending == []
+    assert context.backend_calls == []
+    path = context.source.parent / "unloaded-detect.pt"
+    path.write_bytes(b"changed synthetic weight bytes")
+    with pytest.raises(registry.VisionModelError, match="WEIGHTS_CHANGED"):
+        context.service.preview_training_plan(context.actor, context.project, proposal)
+
+
 def test_launch_is_idempotent_and_persists_before_thread_execution(context):
     request = _request(context)
     first = context.service.create_training_run(context.actor, context.project, request)
