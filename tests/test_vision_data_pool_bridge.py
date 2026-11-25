@@ -786,6 +786,141 @@ def test_revoked_source_invalidates_export_and_previously_bound_input(
         verify_pool_binding(product, ACTOR, project_id, binding)
 
 
+@pytest.fixture
+def pretraining_inputs(reviewed_pool):
+    from visiondata_gate.local_model_registry import LocalVisionModelService
+    from visiondata_gate.vision_model_api import install_vision_model_routes
+
+    _, product, task_id, groups, projection = reviewed_pool
+    project = projection["pool"]["project_id"]
+    service = LocalVisionModelService(product)
+    dataset = service.register_pool_dataset(
+        ACTOR, project, RegisterPoolDetectionDataset(**_request(projection, groups))
+    )
+    app = FastAPI()
+    install_vision_model_routes(app, lambda: ACTOR, lambda: product)
+    route = f"/v1/projects/{project}/vision-pretraining-recipe"
+    body = {
+        "dataset_id": dataset["dataset_id"],
+        "expected_dataset_receipt_sha256": dataset["dataset_receipt_sha256"],
+        "expected_pool_binding_sha256": dataset["pool_binding"]["receipt_sha256"],
+        "budget": {"seed": 7, "image_size": 64, "patch_size": 16, "mask_basis_points": 6250},
+    }
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        yield client, service, task_id, dataset, route, body
+
+
+def test_pretraining_recipe_binds_real_annotation_pool_and_train_only_image_manifest(
+    pretraining_inputs, monkeypatch,
+):
+    client, service, _, dataset, route, body = pretraining_inputs
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("recipe preview must not queue, provision or execute a worker")
+
+    monkeypatch.setattr(type(service), "create_training_run", forbidden)
+    monkeypatch.setattr(type(service), "register_runtime", forbidden)
+    with service.product.store._connection() as connection:
+        changes = connection.execute("SELECT COUNT(*) FROM vision_requests").fetchone()[0]
+    root_before = sorted(service.root.rglob("*"))
+    response = client.post(route, json=body)
+    assert response.status_code == 200, response.text
+    recipe = response.json()
+    assert client.post(route, json=body).json() == recipe
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["etag"] == f'"{recipe["receipt_sha256"]}"'
+    assert response.headers["x-content-sha256"] == recipe["receipt_sha256"]
+    unsigned = {k: v for k, v in recipe.items() if k != "receipt_sha256"}
+
+    def digest(document):
+        return hashlib.sha256(canonical_jcs_bytes(document)).hexdigest()
+
+    assert digest(unsigned) == recipe["receipt_sha256"]
+    assert recipe["schema_version"] == "visiondata-gate.vision-pretraining-recipe.v1"
+    assert recipe["status"] == "HOLD_NO_SELF_SUPERVISED_BACKEND"
+    assert recipe["objective"] == "MASKED_PATCH_RECONSTRUCTION_V1"
+    assert recipe["masked_patches_per_image"] == 10
+    binding = dataset["pool_binding"]
+    assert recipe["lineage"] == {
+        "dataset_id": dataset["dataset_id"],
+        "dataset_receipt_sha256": dataset["dataset_receipt_sha256"],
+        "pool_id": binding["pool_id"],
+        "pool_binding_sha256": binding["receipt_sha256"],
+        "version_id": binding["version_id"],
+        "version_receipt_sha256": binding["version_receipt_sha256"],
+        "snapshot_id": binding["snapshot_id"],
+        "annotation_bindings_sha256": binding["annotation_bindings_sha256"],
+    }
+    dataset_samples = sorted(dataset["dataset_receipt"]["samples"], key=lambda row: row["sample_id"])
+    train_identity = [
+        {key: row[key] for key in ("sample_id", "image_sha256", "pixel_sha256")}
+        for row in dataset_samples
+        if row["split"] == "train"
+    ]
+    assert recipe["data"] == {
+        "gradient_split": "train",
+        "train_image_manifest_sha256": digest(train_identity),
+        "split_counts": {"train": 2, "val": 1, "test": 1},
+        "labels_role": "PROVENANCE_ONLY",
+        "validation_role": "RESERVED_NOT_USED",
+        "test_role": "RESERVED_NOT_USED",
+    }
+    assert recipe["downstream"] == {
+        "task": "SUPERVISED_DETECTION",
+        "checkpoint_status": "NOT_CREATED",
+        "weight_transfer_compatibility": "NOT_VERIFIED",
+        "comparison_baseline": "MATCHED_RANDOM_INITIALIZATION",
+    }
+    assert recipe["run_created"] is recipe["runtime_executed"] is recipe["production_release_allowed"] is False
+    assert recipe["machine_write_permitted"] is recipe["training_authorized"] is False
+    assert recipe["test_evaluation"] == "NOT_RUN"
+    for private in ("image_path", "label_path", "reviewer_name", '"boxes"', str(service.root)):
+        assert private not in response.text
+    changed = client.post(route, json=body | {"budget": body["budget"] | {"seed": 8}}).json()
+    assert changed["receipt_sha256"] != recipe["receipt_sha256"]
+    assert changed["inputs_sha256"] != recipe["inputs_sha256"]
+    assert changed["data"] == recipe["data"]
+    assert sorted(service.root.rglob("*")) == root_before
+    with service.product.store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM vision_requests").fetchone()[0] == changes
+        assert connection.execute("SELECT COUNT(*) FROM vision_records WHERE kind='run'").fetchone()[0] == 0
+
+
+def test_pretraining_recipe_holds_on_mismatch_or_revoked_source(pretraining_inputs):
+    client, service, task_id, _, route, body = pretraining_inputs
+    assert client.post(route, json=body).status_code == 200
+    for invalid in ({"expected_pool_binding_sha256": "a" * 64}, {"expected_dataset_receipt_sha256": "b" * 64}):
+        assert client.post(route, json=body | invalid).status_code == 409
+    for invalid in ({"mask_basis_points": 10000}, {"image_size": 96, "patch_size": 16, "threads": True}):
+        rejected = client.post(route, json=body | {"budget": invalid})
+        assert rejected.status_code == 422
+    codified = client.post(route, json=body | {"objective": "SUPERVISED_DETECTION"})
+    assert codified.status_code == 422
+    smuggled = client.post(route, json=body | {"operator_attests_training_authorized": True, "path": "E:/synthetic-private/file"})
+    assert smuggled.status_code == 422 and "synthetic-private" not in smuggled.text
+    product = service.product
+    source_id = product.store.get_task(ACTOR, task_id).source_id
+    product.revoke_local_source_authorization(
+        ACTOR, source_id,
+        RevokeLocalSourceAuthorizationRequest(
+            reason="Withdraw this test-owned source grant after collecting the recipe",
+            expected_latest_event_sha256=product.list_source_authorization_events(ACTOR, source_id)[-1].event_sha256,
+        ),
+    )
+    invalid_after_revoke = client.post(route, json=body)
+    assert invalid_after_revoke.status_code == 409
+    assert invalid_after_revoke.json()["error"]["code"] == "vision_model_hold"
+
+
+def test_pretraining_recipe_rechecks_frozen_label_file_bytes(pretraining_inputs):
+    client, service, _, dataset, route, body = pretraining_inputs
+    assert client.post(route, json=body).status_code == 200
+    frozen = service.root / "datasets" / dataset["dataset_id"]
+    member = next(row for row in dataset["dataset_receipt"]["samples"] if row["split"] == "val")
+    (frozen / member["label_path"]).write_bytes(b"modified frozen test-owned holdout label")
+    assert client.post(route, json=body).status_code == 409
+
+
 def test_real_nonpassing_gate_qualified_complement_is_not_a_training_dataset(
     reviewed_pool,
 ) -> None:

@@ -53,6 +53,7 @@ POST_PATHS = (
     "vision-models/vision_model_missing/ttt-inferences",
     "vision-inferences/vision_inference_missing/feedback",
     "vision-training-preflight",
+    "vision-pretraining-recipe",
     "vision-training-runs",
     "vision-training-runs/run-missing/cancel",
     "vision-training-runs/run-missing/recover",
@@ -454,6 +455,15 @@ def test_generic_http_dataset_is_explicitly_unbound_and_not_training_eligible(
             headers=OWNER_HEADERS,
             json=training | {"_test_only_allow_unbound_fixtures": True},
         )
+        recipe_rejected = client.post(
+            base + "/vision-pretraining-recipe",
+            headers=OWNER_HEADERS,
+            json={
+                "dataset_id": dataset["dataset_id"],
+                "expected_dataset_receipt_sha256": dataset["dataset_receipt_sha256"],
+                "expected_pool_binding_sha256": "a" * 64,
+            },
+        )
         runs = _sealed(
             client.get(base + "/vision-training-runs", headers=OWNER_HEADERS)
         )
@@ -461,6 +471,7 @@ def test_generic_http_dataset_is_explicitly_unbound_and_not_training_eligible(
     assert dataset["provenance"] == "UNBOUND_EXTERNAL_FIXTURE"
     assert dataset["training_eligible"] is False
     assert dataset["production_release_allowed"] is False
+    assert recipe_rejected.status_code == 409
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "vision_model_hold"
     assert seam_rejected.status_code == 422
@@ -535,6 +546,26 @@ def test_training_preflight_missing_registry_does_not_initialize_it(vision_app):
         )
         assert outsider.status_code == 404
         assert outsider.json() == missing.json()
+    assert not (product.product_root / "vision_models").exists()
+    with product.store._connection() as conn:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='vision_records'"
+        ).fetchone() is None
+
+
+def test_pretraining_recipe_missing_registry_is_read_only_and_hides_project_scope(vision_app):
+    app, product, project_id = vision_app
+    path = f"/v1/projects/{project_id}/vision-pretraining-recipe"
+    body = {
+        "dataset_id": "dataset_missing",
+        "expected_dataset_receipt_sha256": "b" * 64,
+        "expected_pool_binding_sha256": "c" * 64,
+    }
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        owner = client.post(path, headers=OWNER_HEADERS, json=body)
+        outsider = client.post(path, headers={"X-Test-Session": "synthetic-outsider-session"}, json=body)
+    assert owner.status_code == outsider.status_code == 404
+    assert owner.json() == outsider.json() == {"error": "not_found"}
     assert not (product.product_root / "vision_models").exists()
     with product.store._connection() as conn:
         assert conn.execute(

@@ -33,6 +33,7 @@ from .local_model_registry import (
     VisionRunAction,
     VisionTrainingPlanInputs,
 )
+from .vision_pretraining_recipe import VisionPretrainingRecipeInputs
 
 _PRIVATE_HEADERS = {"Cache-Control": "private, no-store"}
 
@@ -459,6 +460,21 @@ def install_vision_model_routes(
     ) -> dict:
         return _bind_receipt(
             LocalVisionModelService(product).preview_training_plan(
+                actor, project_id, request
+            ),
+            response,
+        )
+
+    @router.post("/vision-pretraining-recipe", dependencies=local_only)
+    def preview_pretraining_recipe(
+        project_id: str,
+        request: VisionPretrainingRecipeInputs,
+        response: Response,
+        actor: str = Depends(actor_dependency),
+        product=Depends(product_dependency),
+    ) -> dict:
+        return _bind_receipt(
+            LocalVisionModelService(product).preview_pretraining_recipe(
                 actor, project_id, request
             ),
             response,

@@ -32,9 +32,17 @@ Target: **100 evidence-backed engineering iterations**. Count one round only whe
 - Green: 20/20 Node vision contract tests and 26/26 full Edge visual-model workbench tests (synthetic transport, real forms); TypeScript checks and Vite production build passed. Tests exercise data/weights/budget invalidation, delayed responses, failure, and the unchanged separate human authorization.
 - Scope: the workbench is gated; the existing backend launch API still enforces its own checks and human grants. No live training was launched.
 
+## R003: Bind a read-only self-supervised recipe to current reviewed data
+
+- Use a distinct local, project-member recipe route and a closed parameter set for masked-patch reconstruction. It must not accept an executable, model file, training grant or free-form configuration.
+- Verify the registered dataset bytes against its receipt and recheck the current pool version, authorization and annotation lineage. Bind both the annotation receipt lineage and the pixel identity of the train-only manifest. Keep validation/test reserved and labels provenance-only.
+- Freeze a declared CPU budget, patch size, deterministic seed and mask count. Preserve the future comparison baseline (matched random initialization); a downstream transfer adapter and checkpoint do not exist yet.
+- Red: 7 targeted checks failed against the absent route. Green: the same 7 checks passed (100 deselected) using isolated fixtures, including the real Gate/Data Pool producer over synthetic images. The positive fixture retained 2 train / 1 val / 1 test and produced a stable sealed recipe. Negative cases covered non-local access, missing identity or registry, legacy unbound input, mismatched digests, source revocation and modified frozen holdout labels.
+- The sealed recipe reports `HOLD_NO_SELF_SUPERVISED_BACKEND`, not an executable preflight, checkpoint, evaluation or release. The positive test found no new vision ledger entry, run, or file.
+
 ## Next gates (proposed, not counted)
 
-1. Recipe design: separate supervised-from-scratch, supervised warm-start and self-supervised pretraining. Specify data/holdouts, objective, checkpoint provenance and baseline. An unimplemented recipe must fail closed before scheduling.
+1. Workbench: expose the recipe and its lineage/HOLD separately from the supervised launch flow, using the same verified frozen data selection.
 2. Data: measure annotation import/export and dataset build times on fixed licensed workloads; verify split isolation and per-class availability. Add caching only when one benchmark identifies a bottleneck.
 3. Training adapters: prove one tiny local acceptance per permitted route before considering GPU/distributed support. Record hardware, time/storage budget and recovery.
 4. Evaluation and iteration: compare frozen holdouts and errors at a fixed operating policy, with human approval for changes. Preserve failures and never use a training completion event as release authority.

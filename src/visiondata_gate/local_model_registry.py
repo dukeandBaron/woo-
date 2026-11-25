@@ -25,6 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .audit_envelope import canonical_jcs_bytes
 from .execution_recovery import task_execution_lock
 from .task_store import NotFoundError, ProductStoreError
+from .vision_pretraining_recipe import (
+    VisionPretrainingRecipeInputs,
+    build_pretraining_recipe,
+)
 
 
 SHA = r"^[0-9a-f]{64}$"
@@ -2096,21 +2100,22 @@ class LocalVisionModelService:
                 ):
                     raise VisionModelError("FEEDBACK_REQUIRES_NEW_POOL_AND_GATE")
 
+    def _require_existing_registry(self, conn, actor, project):
+        self._membership(conn, actor, project)
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vision_records'"
+        ).fetchone() is None:
+            raise NotFoundError("visual resource unavailable")
+        if self.root.is_symlink() or self.root.is_junction():
+            raise VisionModelError("REGISTRY_ROOT_LINK_FORBIDDEN")
+
     def _verify_training_plan_inputs(
         self, actor, project, request: VisionTrainingPlanInputs
     ) -> tuple[dict, dict, dict]:
         """Verify current registration and artifact bytes; never start a worker."""
-        from .learning_detection_dataset import verify_detection_dataset
-
         with self.product.store._connection() as conn:
             conn.execute("PRAGMA query_only = ON")
-            self._membership(conn, actor, project)
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vision_records'"
-            ).fetchone() is None:
-                raise NotFoundError("visual resource unavailable")
-            if self.root.is_symlink() or self.root.is_junction():
-                raise VisionModelError("REGISTRY_ROOT_LINK_FORBIDDEN")
+            self._require_existing_registry(conn, actor, project)
             runtime, runtime_private = self._read(
                 conn, project, request.runtime_id, "runtime"
             )
@@ -2128,15 +2133,8 @@ class LocalVisionModelService:
             raise VisionModelError("STALE_RUNTIME")
         if runtime["probe"].get("status") != "ready":
             raise VisionModelError("RUNTIME_UNAVAILABLE")
-        if (
-            dataset["dataset_receipt_sha256"]
-            != request.expected_dataset_receipt_sha256
-        ):
-            raise VisionModelError("STALE_DATASET")
-        self._verify_dataset_source(actor, project, dataset_private)
-        frozen_dataset = verify_detection_dataset(
-            Path(dataset_private["dataset_root"]),
-            request.expected_dataset_receipt_sha256,
+        frozen_dataset = self._verify_frozen_training_dataset(
+            actor, project, dataset, dataset_private, request.expected_dataset_receipt_sha256
         )
         _file(
             runtime_private["executable_path"],
@@ -2161,6 +2159,52 @@ class LocalVisionModelService:
             "dataset_private": dataset_private,
             "model_private": model_private,
         }
+
+    def _verify_frozen_training_dataset(
+        self, actor, project, dataset, private, expected_receipt
+    ) -> dict:
+        from .learning_detection_dataset import verify_detection_dataset
+
+        if dataset["dataset_receipt_sha256"] != expected_receipt:
+            raise VisionModelError("STALE_DATASET")
+        self._verify_dataset_source(actor, project, private)
+        return verify_detection_dataset(Path(private["dataset_root"]), expected_receipt)
+
+    def preview_pretraining_recipe(
+        self, actor, project, request: VisionPretrainingRecipeInputs
+    ) -> dict:
+        request = VisionPretrainingRecipeInputs.model_validate(request.model_dump(mode="json"))
+        try:
+            with self.product.store._connection() as conn:
+                conn.execute("PRAGMA query_only = ON")
+                self._require_existing_registry(conn, actor, project)
+                dataset, private = self._read(conn, project, request.dataset_id, "dataset")
+            binding = dataset.get("pool_binding")
+            if (
+                dataset.get("provenance") != "GOVERNED_DATA_POOL_V1"
+                or dataset.get("training_eligible") is not True
+                or not isinstance(binding, dict)
+                or binding != private.get("pool_binding")
+            ):
+                raise VisionModelError("GOVERNED_POOL_DATASET_REQUIRED")
+            if binding["receipt_sha256"] != request.expected_pool_binding_sha256:
+                raise VisionModelError("STALE_POOL_BINDING")
+            frozen = self._verify_frozen_training_dataset(
+                actor, project, dataset, private, request.expected_dataset_receipt_sha256
+            )
+            if (
+                frozen["source_version"] != binding["version_id"]
+                or frozen["manifest_sha256"] != binding["detection_manifest_sha256"]
+            ):
+                raise VisionModelError("FROZEN_POOL_LINEAGE_MISMATCH")
+            # Recheck the authoritative pool head and grant after the file reads.
+            with self.product.store._connection() as conn:
+                conn.execute("PRAGMA query_only = ON")
+                conn.execute("BEGIN")
+                self._verify_pool_transaction(conn, actor, project, private)
+            return build_pretraining_recipe(project, request, frozen, binding)
+        except (OSError, ValueError, TypeError, KeyError):
+            raise VisionModelError("VISION_PRETRAINING_RECIPE_INPUT_INVALID") from None
 
     def preview_training_plan(
         self, actor, project, request: VisionTrainingPlanInputs
