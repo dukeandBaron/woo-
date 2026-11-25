@@ -47,9 +47,19 @@ Target: **100 evidence-backed engineering iterations**. Count one round only whe
 - A changed dataset, recipe budget, project or login generation drops the receipt. The read-only recipe cannot satisfy supervised preflight, cause a launch, or acquire a write lock.
 - Green: 21/21 Node vision contract tests, 27/27 full Edge workbench tests (synthetic transport), and the TypeScript/Vite production build passed. The recipe stays HOLD; no self-supervised job or checkpoint exists.
 
+## R005: Execute the recipe as a bounded offline CPU reference
+
+- Baseline `f651c9d`: a governed recipe can be reviewed, but no optimizer or reference weights exist. The public model workbench stays HOLD throughout this round.
+- Test first in `tests/test_vision_pretraining_reference.py`: real synthetic frozen data and one finite optimizer run, fixed-seed holdout substitution, missing consent and stale/tampered inputs, and a killed/reaped worker after deadline.
+- Implement a small NumPy contextual patch model and fixed-size numeric checkpoint in `visiondata_gate.vision_pretraining_numpy`. Reuse the held recipe's RGB resize, explicit masks, and masked-pixel MSE; keep labels and non-train images outside the optimizer.
+- Implement `visiondata_gate.vision_pretraining_reference`: explicit offline consent, pinned recipe/frozen identities, process deadline/CPU thread cap, new output directory, sealed checkpoint receipt. Reopen only numeric weights from the expected byte layout. Never grant live project, model selection or production authority.
+- Verify with `pytest tests/test_vision_pretraining_reference.py tests/test_learning_detection_dataset.py -q`, and a deterministic synthetic smoke with fixed data, budget and seed. Do not count a dry run or a training loss as held-out improvement.
+- Red: five missing-engine checks failed; a separate RED showed a caller mutation after training could enter the receipt until the draft was copied. Final green: 66 passed / 1 Windows symlink skip across the reference and frozen-dataset suites.
+- Measured synthetic reference: 3 train / 1 val / 1 test; 2 fit epochs, 6 visits, 4 optimizer steps; 27,840 checkpoint bytes. Replacing both holdouts kept the checkpoint byte-identical. The actual worker timeout was exercised; no detector evaluation or live product execution occurred.
+
 ## Next gates (proposed, not counted)
 
-1. Reference runner: prove a bounded local CPU acceptance on synthetic/authorized data before connecting a self-supervised executor to the workbench. Check that only train images are fitted, all budgets are enforced, and the checkpoint is version-bound. Keep the workbench recipe on HOLD until authorization and execution contracts are ready.
-2. Transfer and evaluation: verify encoder compatibility for a selected detector and compare against random initialization under matched frozen splits, seeds and downstream budgets. Do not claim an improvement from a successful smoke run.
+1. Reference evaluation: reopen the sealed reference checkpoint and test a matched synthetic validation comparison; the test split stays reserved. Do not claim downstream detector improvement.
+2. Transfer and execution authority: verify an actual downstream encoder adapter and an explicit, scoped launch approval before connecting an executable route to the workbench.
 3. Data: time annotation import/export and dataset verification on fixed licensed workloads; account for sample counts and recheck split isolation. Add caching only after measuring a bottleneck and without weakening freshness or authorization.
 4. Iteration: compare errors at a fixed operating policy, require human approval for changes, preserve failures and never use training completion as release authority.
