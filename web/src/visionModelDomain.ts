@@ -63,6 +63,7 @@ export interface VisionDataset extends VisionBase {
 }
 export interface PoolDetectionBinding {
   schema_version: 'visiondata-gate.pool-detection-binding.v1'; project_id: string; pool_id: string; version_id: string; task_id: string;
+  snapshot_id: string; annotation_bindings_sha256: string;
   pool_receipt_sha256: string; version_receipt_sha256: string; class_names: string[]; class_mapping_sha256: string;
   groups: Record<string, string>; normal_sample_ids: string[]; detection_manifest_sha256: string;
   sample_count: number; production_release_allowed: false; label_truth_authority: false; receipt_sha256: string;
@@ -239,6 +240,13 @@ export interface VisionTrainingPreflight {
   requires_operator_training_authorization: true; requires_weight_load_authorization: boolean; self_supervised_pretraining_supported: false;
   run_created: false; runtime_executed: false; test_evaluation: 'NOT_RUN'; production_release_allowed: false; machine_write_permitted: false;
 }
+export interface VisionPretrainingBudget {
+  epochs: number; image_size: number; patch_size: number; mask_basis_points: number;
+  batch: number; seed: number; max_seconds: number; threads: number;
+}
+export interface VisionPretrainingProposal {
+  dataset_id: string; expected_dataset_receipt_sha256: string; expected_pool_binding_sha256: string; budget: VisionPretrainingBudget;
+}
 export interface VisionRunActionRequest extends VisionApproval { expected_run_sha256: string; operator_attests_reviewed: true }
 export interface SelectVisionRequest extends VisionRunActionRequest { action: 'APPROVE_SANDBOX' | 'REJECT'; expected_candidate_weights_sha256: string }
 export interface ReviewVisionFeedbackRequest extends VisionRunActionRequest { expected_feedback_sha256: string; classification: VisionFeedbackClassification }
@@ -342,6 +350,53 @@ export async function validateVisionTrainingPreflight(value: unknown, scope: Vis
     && v.test_evaluation === 'NOT_RUN' && v.production_release_allowed === false && v.machine_write_permitted === false);
   return v as unknown as VisionTrainingPreflight;
 }
+export function validateVisionPretrainingProposal(value: unknown, scope: VisionScope, dataset: VisionDataset): VisionPretrainingProposal {
+  validateVisionScope(scope);
+  const v = visionObject(value); fields(v, ['dataset_id', 'expected_dataset_receipt_sha256', 'expected_pool_binding_sha256', 'budget']);
+  visionId(v.dataset_id); visionSha(v.expected_dataset_receipt_sha256); visionSha(v.expected_pool_binding_sha256);
+  const binding = dataset.pool_binding;
+  visionEnsure(binding && dataset.project_id === scope.projectId && binding.project_id === scope.projectId
+    && v.dataset_id === dataset.dataset_id && v.expected_dataset_receipt_sha256 === dataset.dataset_receipt_sha256
+    && v.expected_pool_binding_sha256 === binding.receipt_sha256);
+  const b = visionObject(v.budget);
+  fields(b, ['epochs', 'image_size', 'patch_size', 'mask_basis_points', 'batch', 'seed', 'max_seconds', 'threads']);
+  integer(b.epochs, 1, 5); integer(b.image_size, 64, 320); visionEnsure(b.image_size % 32 === 0);
+  visionEnsure(b.patch_size === 8 || b.patch_size === 16 || b.patch_size === 32);
+  integer(b.mask_basis_points, 2500, 7500); integer(b.batch, 1, 8); integer(b.seed, 0, 2147483647);
+  integer(b.max_seconds, 10, 600); integer(b.threads, 1, 4);
+  return v as unknown as VisionPretrainingProposal;
+}
+
+export async function validateVisionPretrainingRecipe(value: unknown, scope: VisionScope, input: VisionPretrainingProposal, dataset: VisionDataset, etag: string | null, contentSha: string | null) {
+  const proposal = validateVisionPretrainingProposal(input, scope, dataset);
+  const { receipt_sha256, ...received } = await verifyVisionSeal(value, etag, contentSha);
+  visionSha(receipt_sha256);
+  const binding = dataset.pool_binding!;
+  const train = dataset.dataset_receipt.samples.filter(row => row.split === 'train')
+    .sort((a, b) => a.sample_id < b.sample_id ? -1 : a.sample_id > b.sample_id ? 1 : 0)
+    .map(({ sample_id, image_sha256, pixel_sha256 }) => ({ sample_id, image_sha256, pixel_sha256 }));
+  const budget = proposal.budget, patches = (budget.image_size / budget.patch_size) ** 2;
+  const expected = {
+    schema_version: 'visiondata-gate.vision-pretraining-recipe.v1', project_id: scope.projectId, status: 'HOLD_NO_SELF_SUPERVISED_BACKEND',
+    inputs_sha256: await visionDigest(proposal), objective: 'MASKED_PATCH_RECONSTRUCTION_V1', device: 'cpu',
+    budget, patches_per_image: patches, masked_patches_per_image: Math.floor(patches * budget.mask_basis_points / 10000),
+    training_contract: { image_transform: 'RGB_BILINEAR_SQUARE_UNIT_INTERVAL', mask_selector: 'SEEDED_UNIFORM_WITHOUT_REPLACEMENT',
+      loss: 'MASKED_PIXEL_MSE', initialization: 'RANDOM_NO_EXTERNAL_WEIGHTS' },
+    lineage: { dataset_id: proposal.dataset_id, dataset_receipt_sha256: proposal.expected_dataset_receipt_sha256,
+      pool_id: binding.pool_id, pool_binding_sha256: binding.receipt_sha256, version_id: binding.version_id,
+      version_receipt_sha256: binding.version_receipt_sha256, snapshot_id: binding.snapshot_id, annotation_bindings_sha256: binding.annotation_bindings_sha256 },
+    data: { gradient_split: 'train', train_image_manifest_sha256: await visionDigest(train), split_counts: dataset.dataset_receipt.split_counts,
+      labels_role: 'PROVENANCE_ONLY', validation_role: 'RESERVED_NOT_USED', test_role: 'RESERVED_NOT_USED' },
+    downstream: { task: 'SUPERVISED_DETECTION', checkpoint_status: 'NOT_CREATED', weight_transfer_compatibility: 'NOT_VERIFIED',
+      comparison_baseline: 'MATCHED_RANDOM_INITIALIZATION' },
+    training_authorized: false, run_created: false, runtime_executed: false, test_evaluation: 'NOT_RUN',
+    production_release_allowed: false, machine_write_permitted: false,
+  } as const;
+  visionEnsure(canonicalizeJcs(received) === canonicalizeJcs(expected));
+  return { ...expected, receipt_sha256 };
+}
+export type VisionPretrainingRecipe = Awaited<ReturnType<typeof validateVisionPretrainingRecipe>>;
+
 export function validateVisionBudget(value: unknown): VisionBudget {
   const v = visionObject(value); fields(v, ['epochs', 'imgsz', 'batch', 'seed', 'max_seconds', 'threads']);
   integer(v.epochs, 1, 5); integer(v.imgsz, 64, 320); visionEnsure(v.imgsz % 32 === 0);

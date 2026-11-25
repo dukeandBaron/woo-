@@ -40,9 +40,16 @@ Target: **100 evidence-backed engineering iterations**. Count one round only whe
 - Red: 7 targeted checks failed against the absent route. Green: the same 7 checks passed (100 deselected) using isolated fixtures, including the real Gate/Data Pool producer over synthetic images. The positive fixture retained 2 train / 1 val / 1 test and produced a stable sealed recipe. Negative cases covered non-local access, missing identity or registry, legacy unbound input, mismatched digests, source revocation and modified frozen holdout labels.
 - The sealed recipe reports `HOLD_NO_SELF_SUPERVISED_BACKEND`, not an executable preflight, checkpoint, evaluation or release. The positive test found no new vision ledger entry, run, or file.
 
+## R004: Show the verified held recipe in the model workbench
+
+- Red: the contract test observed no client operation and the Edge test observed no workbench recipe entry.
+- The supervised form and the separate recipe panel share the same frozen dataset selection but have independent budgets and receipts. The client independently verifies the annotation snapshot lineage, exact recipe parameters, split counts and train-image digest. Selecting an external manifest leaves recipe generation disabled.
+- A changed dataset, recipe budget, project or login generation drops the receipt. The read-only recipe cannot satisfy supervised preflight, cause a launch, or acquire a write lock.
+- Green: 21/21 Node vision contract tests, 27/27 full Edge workbench tests (synthetic transport), and the TypeScript/Vite production build passed. The recipe stays HOLD; no self-supervised job or checkpoint exists.
+
 ## Next gates (proposed, not counted)
 
-1. Workbench: expose the recipe and its lineage/HOLD separately from the supervised launch flow, using the same verified frozen data selection.
-2. Data: measure annotation import/export and dataset build times on fixed licensed workloads; verify split isolation and per-class availability. Add caching only when one benchmark identifies a bottleneck.
-3. Training adapters: prove one tiny local acceptance per permitted route before considering GPU/distributed support. Record hardware, time/storage budget and recovery.
-4. Evaluation and iteration: compare frozen holdouts and errors at a fixed operating policy, with human approval for changes. Preserve failures and never use a training completion event as release authority.
+1. Reference runner: prove a bounded local CPU acceptance on synthetic/authorized data before connecting a self-supervised executor to the workbench. Check that only train images are fitted, all budgets are enforced, and the checkpoint is version-bound. Keep the workbench recipe on HOLD until authorization and execution contracts are ready.
+2. Transfer and evaluation: verify encoder compatibility for a selected detector and compare against random initialization under matched frozen splits, seeds and downstream budgets. Do not claim an improvement from a successful smoke run.
+3. Data: time annotation import/export and dataset verification on fixed licensed workloads; account for sample counts and recheck split isolation. Add caching only after measuring a bottleneck and without weakening freshness or authorization.
+4. Iteration: compare errors at a fixed operating policy, require human approval for changes, preserve failures and never use training completion as release authority.

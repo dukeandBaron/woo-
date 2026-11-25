@@ -159,6 +159,32 @@ export async function preflightReceipt(request, overrides = {}) {
     requires_operator_training_authorization: true, requires_weight_load_authorization: warm, self_supervised_pretraining_supported: false,
     run_created: false, runtime_executed: false, test_evaluation: 'NOT_RUN', production_release_allowed: false, machine_write_permitted: false, ...overrides });
 }
+export function pretrainingProposal(dataset) {
+  return { dataset_id: dataset.dataset_id, expected_dataset_receipt_sha256: dataset.dataset_receipt_sha256,
+    expected_pool_binding_sha256: dataset.pool_binding.receipt_sha256,
+    budget: { epochs: 1, image_size: 64, patch_size: 16, mask_basis_points: 6250, batch: 2, seed: 0, max_seconds: 120, threads: 2 } };
+}
+export async function pretrainingRecipe(request, dataset, overrides = {}) {
+  const binding = dataset.pool_binding;
+  const trainImages = dataset.dataset_receipt.samples.filter(row => row.split === 'train')
+    .sort((a, b) => a.sample_id < b.sample_id ? -1 : a.sample_id > b.sample_id ? 1 : 0)
+    .map(({ sample_id, image_sha256, pixel_sha256 }) => ({ sample_id, image_sha256, pixel_sha256 }));
+  const patches = (request.budget.image_size / request.budget.patch_size) ** 2;
+  return seal({ schema_version: 'visiondata-gate.vision-pretraining-recipe.v1', project_id: scope.projectId,
+    status: 'HOLD_NO_SELF_SUPERVISED_BACKEND', inputs_sha256: await digest(request), objective: 'MASKED_PATCH_RECONSTRUCTION_V1', device: 'cpu',
+    budget: request.budget, patches_per_image: patches, masked_patches_per_image: Math.floor(patches * request.budget.mask_basis_points / 10000),
+    training_contract: { image_transform: 'RGB_BILINEAR_SQUARE_UNIT_INTERVAL', mask_selector: 'SEEDED_UNIFORM_WITHOUT_REPLACEMENT',
+      loss: 'MASKED_PIXEL_MSE', initialization: 'RANDOM_NO_EXTERNAL_WEIGHTS' },
+    lineage: { dataset_id: dataset.dataset_id, dataset_receipt_sha256: dataset.dataset_receipt_sha256, pool_id: binding.pool_id, pool_binding_sha256: binding.receipt_sha256,
+      version_id: binding.version_id, version_receipt_sha256: binding.version_receipt_sha256, snapshot_id: binding.snapshot_id,
+      annotation_bindings_sha256: binding.annotation_bindings_sha256 },
+    data: { gradient_split: 'train', train_image_manifest_sha256: await digest(trainImages), split_counts: dataset.dataset_receipt.split_counts,
+      labels_role: 'PROVENANCE_ONLY', validation_role: 'RESERVED_NOT_USED', test_role: 'RESERVED_NOT_USED' },
+    downstream: { task: 'SUPERVISED_DETECTION', checkpoint_status: 'NOT_CREATED', weight_transfer_compatibility: 'NOT_VERIFIED',
+      comparison_baseline: 'MATCHED_RANDOM_INITIALIZATION' },
+    training_authorized: false, run_created: false, runtime_executed: false, test_evaluation: 'NOT_RUN',
+    production_release_allowed: false, machine_write_permitted: false, ...overrides });
+}
 export function response(value, headers = {}) { return new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json', ETag: `"${value.receipt_sha256}"`, 'X-Content-SHA256': value.receipt_sha256, 'Cache-Control': 'private, no-store', ...headers } }); }
 export async function poolProjection() {
   const members = manifest().samples.map(sample => ({ sample_id: sample.sample_id, source_task_id: 'task_pool_test', split: sample.split, category: 'defect', annotation_requirement: 'REQUIRED',

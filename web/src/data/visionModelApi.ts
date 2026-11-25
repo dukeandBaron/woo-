@@ -4,12 +4,13 @@ import { getDataPool } from './dataPoolApi.ts';
 import {
   VisionContractError, validateVisionScope, validateVisionRequest, validateVisionRecord, validateVisionList,
   validateVisionTrainingProposal, validateVisionTrainingPreflight,
+  validateVisionPretrainingProposal, validateVisionPretrainingRecipe,
   validateVisionCapabilities, validateVisionTttCapabilities, validateVisionOperationReceipt, validateVisionFeedbackList, validateNormalityFeedbackList, validateNormalityFollowupList, validateNormalityFollowupAnnotations, isNormalityFollowupOperation, visionEnsure, visionId, visionDigest, validateVisionOperation,
 } from '../visionModelDomain.ts';
 import type { VisionScope, VisionKind, VisionRecord, VisionModel, VisionRuntime, VisionDataset, VisionRun, VisionInferenceAsset, VisionInference,
   VisionCapabilities, VisionMutationOperation, VisionPending, VisionOperationReceipt, VisionFeedback, NormalityFeedback, VisionTttFailure, VisionTttCapabilities,
   NormalityFollowupImport, NormalityFollowupWorkOrder, NormalityFollowupList, NormalityFollowupAnnotations, NormalityFollowupKind,
-  VisionTrainingProposal, VisionTrainingPreflight } from '../visionModelDomain.ts';
+  VisionTrainingProposal, VisionTrainingPreflight, VisionPretrainingProposal, VisionPretrainingRecipe } from '../visionModelDomain.ts';
 
 /** No retries, downloads, implicit probes or training. All mutation calls are explicit. */
 const collection: Record<VisionKind, string> = { model: 'vision-models', runtime: 'vision-runtimes', dataset: 'vision-datasets', run: 'vision-training-runs',
@@ -28,17 +29,29 @@ async function read<T>(scope: VisionScope, path: string, check: (value: unknown,
 export function getVisionCapabilities(scope: VisionScope): Promise<VisionCapabilities> {
   return read(scope, `${base(scope)}/vision-capabilities`, (v, r) => validateVisionCapabilities(v, scope, r.headers.get('ETag'), r.headers.get('X-Content-SHA256')));
 }
-/** POST carries a sizable proposal, but this endpoint is read-only: no write lock, grant, or retry. */
-export async function previewVisionTraining(scope: VisionScope, input: VisionTrainingProposal, signal?: AbortSignal): Promise<VisionTrainingPreflight> {
-  const path = `${base(scope)}/vision-training-preflight`, generation = getIdentitySessionSnapshot().generation;
-  const body = JSON.stringify(validateVisionTrainingProposal(input));
+/** Planning POSTs carry proposal bodies but never use the mutation ledger, retry or grant authority. */
+async function postVisionPreview<T>(
+  scope: VisionScope, segment: 'vision-training-preflight' | 'vision-pretraining-recipe', body: string,
+  check: (value: unknown, response: Response) => Promise<T>, signal?: AbortSignal,
+): Promise<T> {
+  const path = `${base(scope)}/${segment}`, generation = getIdentitySessionSnapshot().generation;
   const checkContext = () => { signal?.throwIfAborted(); scoped(scope); visionEnsure(getIdentitySessionSnapshot().generation === generation); };
   checkContext();
   const response = await operatorFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal });
   checkContext();
-  const result = await validateVisionTrainingPreflight(await payload(response), scope, JSON.parse(body), response.headers.get('ETag'), response.headers.get('X-Content-SHA256'));
+  const result = await check(await payload(response), response);
   checkContext();
   return result;
+}
+export async function previewVisionTraining(scope: VisionScope, input: VisionTrainingProposal, signal?: AbortSignal): Promise<VisionTrainingPreflight> {
+  const body = JSON.stringify(validateVisionTrainingProposal(input));
+  return postVisionPreview(scope, 'vision-training-preflight', body, (value, response) =>
+    validateVisionTrainingPreflight(value, scope, JSON.parse(body), response.headers.get('ETag'), response.headers.get('X-Content-SHA256')), signal);
+}
+export async function previewVisionPretrainingRecipe(scope: VisionScope, input: VisionPretrainingProposal, dataset: VisionDataset, signal?: AbortSignal): Promise<VisionPretrainingRecipe> {
+  const body = JSON.stringify(validateVisionPretrainingProposal(input, scope, dataset));
+  return postVisionPreview(scope, 'vision-pretraining-recipe', body, (value, response) =>
+    validateVisionPretrainingRecipe(value, scope, JSON.parse(body), dataset, response.headers.get('ETag'), response.headers.get('X-Content-SHA256')), signal);
 }
 export function getVisionTttCapabilities(scope: VisionScope): Promise<VisionTttCapabilities> {
   return read(scope, `${base(scope)}/vision-ttt-capabilities`, (v, r) => validateVisionTttCapabilities(v, scope, r.headers.get('ETag'), r.headers.get('X-Content-SHA256')));

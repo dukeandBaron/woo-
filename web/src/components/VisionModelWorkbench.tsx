@@ -4,10 +4,10 @@ import { Activity, Cpu, Database, FileCheck2, RefreshCw, ShieldCheck, SlidersHor
 import { useProduct } from '../ProductContext';
 import { getIdentityActorId, getIdentitySessionSnapshot, subscribeIdentitySession } from '../identitySession.ts';
 import { getVisionCapabilities, listVisionRecords, getVisionRun, getVisionModel, getVisionInferenceAsset, getVisionInference, getVisionOperation, getVisionFeedback,
-  getVisionPool, getVisionHeatmap, getNormalityFeedback, getNormalityFollowup, getNormalityFollowupAnnotations, getVisionTttCapabilities, previewVisionTraining, prepareVisionMutation, sendVisionMutation, visionWriteKnownRejected, visionErrorMessage } from '../data/visionModelApi.ts';
-import { parseDetectionManifest, parseVisionPending, validateVisionTrainingProposal, visionPendingStorageKey, visionStatusLabel, visionEnsure } from '../visionModelDomain.ts';
+  getVisionPool, getVisionHeatmap, getNormalityFeedback, getNormalityFollowup, getNormalityFollowupAnnotations, getVisionTttCapabilities, previewVisionTraining, previewVisionPretrainingRecipe, prepareVisionMutation, sendVisionMutation, visionWriteKnownRejected, visionErrorMessage } from '../data/visionModelApi.ts';
+import { parseDetectionManifest, parseVisionPending, validateVisionTrainingProposal, validateVisionPretrainingProposal, visionPendingStorageKey, visionStatusLabel, visionEnsure } from '../visionModelDomain.ts';
 import type { VisionScope, VisionPending, VisionMutationOperation, VisionRecord, VisionModel, VisionNormalityModel, VisionRuntime, VisionDataset, VisionRun,
-  VisionInferenceAsset, VisionInference, VisionCapabilities, VisionApproval, VisionBudget, DetectionManifest, CreateVisionRunRequest, VisionTrainingProposal, VisionTrainingPreflight, VisionFeedback,
+  VisionInferenceAsset, VisionInference, VisionCapabilities, VisionApproval, VisionBudget, DetectionManifest, CreateVisionRunRequest, VisionTrainingProposal, VisionPretrainingBudget, VisionPretrainingProposal, VisionFeedback,
   VisionFeedbackClassification, NormalityFeedback, NormalityFeedbackClassification, NormalityFollowupImport, NormalityFollowupWorkOrder, NormalityFollowupList, NormalityFollowupAnnotations, VisionTttCapabilities, VisionTttFailure, VisionTttBudget, VisionTttReport, RegisterNormalityModelPackRequest, ApproveNormalityModelPackRequest, RegisterVisionInferenceAssetRequest, RunNormalityInferenceRequest } from '../visionModelDomain.ts';
 import type { DataPoolProjection } from '../dataPoolDomain.ts';
 import '../styles/vision-models.css';
@@ -453,21 +453,19 @@ function PoolDatasetForm({ scope, poolId, expectedVersionId, canAct, execute }: 
   </form>;
 }
 
-function TrainingPreflightActions({ scope, sessionGeneration, proposal, formReady, onLaunch, children }: {
-  scope: VisionScope; sessionGeneration: number; proposal: VisionTrainingProposal | null; formReady: boolean;
-  onLaunch: (proposal: VisionTrainingProposal) => void; children: ReactNode;
-}) {
-  const [receipt, setReceipt] = useState<VisionTrainingPreflight>();
+/** Parents key the receipt scope by the complete draft; unmount also aborts transport. */
+function useReadOnlyDraft<T>(sessionGeneration: number, load?: (signal: AbortSignal) => Promise<T>) {
+  const [receipt, setReceipt] = useState<T>();
   const [checking, setChecking] = useState(false), [failed, setFailed] = useState(false);
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => request.current?.abort(), []);
   const currentSession = () => getIdentitySessionSnapshot().generation === sessionGeneration;
   async function preview() {
-    if (!proposal || request.current || !currentSession()) return;
+    if (!load || request.current || !currentSession()) return;
     const active = new AbortController(); request.current = active;
     setReceipt(undefined); setFailed(false); setChecking(true);
     try {
-      const result = await previewVisionTraining(scope, proposal, active.signal);
+      const result = await load(active.signal);
       if (!active.signal.aborted && currentSession()) setReceipt(result);
     } catch {
       if (!active.signal.aborted && currentSession()) setFailed(true);
@@ -476,6 +474,16 @@ function TrainingPreflightActions({ scope, sessionGeneration, proposal, formRead
       if (!active.signal.aborted && currentSession()) setChecking(false);
     }
   }
+  return { receipt, checking, failed, preview, currentSession, discard: () => setReceipt(undefined) };
+}
+
+function TrainingPreflightActions({ scope, sessionGeneration, proposal, formReady, onLaunch, children }: {
+  scope: VisionScope; sessionGeneration: number; proposal: VisionTrainingProposal | null; formReady: boolean;
+  onLaunch: (proposal: VisionTrainingProposal) => void; children: ReactNode;
+}) {
+  const { receipt, checking, failed, preview, currentSession, discard } = useReadOnlyDraft(
+    sessionGeneration, proposal ? signal => previewVisionTraining(scope, proposal, signal) : undefined,
+  );
   return <>
     <div className={receipt ? 'vision-models__notice' : 'vision-models__inline-hold'} role="status">
       <strong>{receipt ? '预检已核验 · 等待人工授权' : checking ? '正在核验当前训练草稿…' : '当前草稿需要预检'}</strong>
@@ -487,10 +495,73 @@ function TrainingPreflightActions({ scope, sessionGeneration, proposal, formRead
     {children}
     <button type="button" disabled={!receipt || !formReady || checking} onClick={() => {
       if (!receipt || !proposal || !formReady || checking || !currentSession()) return;
-      setReceipt(undefined);
+      discard();
       onLaunch(proposal);
     }}>按本次授权启动 CPU 训练</button>
   </>;
+}
+
+function PretrainingRecipeActions({ scope, generation, dataset, proposal }: {
+  scope: VisionScope; generation: number; dataset?: VisionDataset; proposal: VisionPretrainingProposal | null;
+}) {
+  const { receipt, checking, failed, preview } = useReadOnlyDraft(
+    generation, dataset && proposal ? signal => previewVisionPretrainingRecipe(scope, proposal, dataset, signal) : undefined,
+  );
+  return <>
+    <button type="button" disabled={!proposal || checking} onClick={() => void preview()}>
+      {checking ? '正在核验配方…' : '核验并生成预训练配方'}
+    </button>
+    {failed && <p className="vision-models__inline-hold" role="alert">配方核验未通过。请刷新并确认当前数据池版本和冻结数据；没有启动训练。</p>}
+    {receipt && <div className="vision-models__inline-hold" role="status">
+      <strong>配方已核验 · HOLD：尚未接入预训练执行器</strong>
+      <p>遮挡重建：{receipt.masked_patches_per_image} / {receipt.patches_per_image} 图块。数据池版本：<code>{receipt.lineage.version_id}</code>。</p>
+      <p>冻结分母：train {receipt.data.split_counts.train} / val {receipt.data.split_counts.val} / test {receipt.data.split_counts.test}。仅拟使用 train；标注只用于追溯。</p>
+      <Sha label="标注来源绑定 SHA-256" value={receipt.lineage.annotation_bindings_sha256} />
+      <Sha label="配方回执 SHA-256" value={receipt.receipt_sha256} />
+      <p>未创建任务、未产生权重；接入后还需验证能否迁移到下游检测，并与同数据、同预算的随机初始化对照。</p>
+    </div>}
+  </>;
+}
+
+function PretrainingRecipePanel({ scope, generation, dataset, canAct }: {
+  scope: VisionScope; generation: number; dataset?: VisionDataset; canAct: boolean;
+}) {
+  const [budget, setBudget] = useState<VisionPretrainingBudget>({
+    epochs: 1, image_size: 64, patch_size: 16, mask_basis_points: 6250, batch: 2, seed: 0, max_seconds: 120, threads: 2,
+  });
+  let proposal: VisionPretrainingProposal | null = null;
+  if (canAct && dataset?.pool_binding) {
+    try {
+      proposal = validateVisionPretrainingProposal({ dataset_id: dataset.dataset_id, expected_dataset_receipt_sha256: dataset.dataset_receipt_sha256,
+        expected_pool_binding_sha256: dataset.pool_binding.receipt_sha256, budget }, scope, dataset);
+    } catch { /* Out-of-bounds fields leave the recipe unavailable. */ }
+  }
+  const ratio = budget.mask_basis_points / 100;
+  return <details className="vision-models__external">
+    <summary>自监督预训练配方（只读）</summary>
+    <p>在当前冻结数据集上设计遮挡重建。标注只用于追溯，验证集和测试集不会进入预训练。这里只生成可复核的配方，不启动训练。</p>
+    {!dataset?.pool_binding ? <p className="vision-models__inline-hold">请选择由当前已复核数据池版本登记的冻结数据集；外部清单不能用于此配方。</p> : <>
+      <div className="vision-models__budget">
+        <label>配方图块边长<select value={budget.patch_size} onChange={event => setBudget(current => ({ ...current, patch_size: Number(event.target.value) }))}>
+          {[8, 16, 32].map(size => <option key={size} value={size}>{size} 像素</option>)}
+        </select></label>
+        <label>配方遮挡比例（%）<input type="number" min={25} max={75} step={0.5} value={Number.isFinite(ratio) ? ratio : ''} onChange={event => {
+          const value = event.target.valueAsNumber;
+          setBudget(current => ({ ...current, mask_basis_points: value * 100 }));
+        }} /></label>
+        {([{ key: 'image_size', label: '配方图像边长', min: 64, max: 320, step: 32 }, { key: 'epochs', label: '配方轮次', min: 1, max: 5 },
+          { key: 'batch', label: '配方 Batch', min: 1, max: 8 }, { key: 'seed', label: '配方 Seed', min: 0, max: 2147483647 },
+          { key: 'max_seconds', label: '配方最长秒数', min: 10, max: 600 }, { key: 'threads', label: '配方 CPU 线程', min: 1, max: 4 }] as const)
+          .map(field => <label key={field.key}>{field.label}<input type="number" min={field.min} max={field.max} step={'step' in field ? field.step : 1}
+            value={Number.isFinite(budget[field.key]) ? budget[field.key] : ''} onChange={event => {
+              const value = event.target.valueAsNumber;
+              setBudget(current => ({ ...current, [field.key]: value }));
+            }} /></label>)}
+      </div>
+      {!proposal && canAct && <p className="vision-models__inline-hold">请把配方参数调回字段标注的范围内。</p>}
+    </>}
+    <PretrainingRecipeActions key={JSON.stringify([generation, proposal, dataset?.receipt_sha256])} scope={scope} generation={generation} dataset={dataset} proposal={proposal} />
+  </details>;
 }
 
 function TrainingForm({ scope, canAct, execute, runtimes, datasets, models, feedback, activeRun }: { scope: VisionScope; canAct: boolean; execute: Execute; runtimes: VisionRuntime[]; datasets: VisionDataset[]; models: VisionModel[]; feedback: VisionFeedback[]; activeRun: boolean }) {
@@ -539,6 +610,7 @@ function TrainingForm({ scope, canAct, execute, runtimes, datasets, models, feed
       {runtime && <><Sha label="运行环境指纹（不是 exe SHA）" value={runtime.runtime_sha256} />{!runtimeReady && <p className="vision-models__inline-hold">HOLD：所选环境缺少当前后端能力；未安装或切换环境。</p>}</>}
       <label>冻结数据集<select aria-label="冻结数据集" value={datasetId} onChange={e => setDatasetId(e.target.value)} required><option value="">请选择已登记检测数据集</option>{datasets.map(item => <option key={item.dataset_id} value={item.dataset_id}>{item.dataset_receipt.source_version} · {item.dataset_receipt.samples.length} 样本</option>)}</select></label>
       {dataset && <Sha label="冻结数据集 SHA-256" value={dataset.dataset_receipt_sha256} />}
+      <PretrainingRecipePanel scope={scope} generation={generation} dataset={dataset} canAct={canAct && !activeRun} />
       <div className="vision-models__feedback-link"><h4>回应已复核反馈（可选）</h4><p>先在右侧读取并人工分类上一轮反馈。选中的反馈只建立证据关联，不自动关闭问题，也不允许 val / test 回灌训练。</p>
         {!feedback.length && <small>尚未读取反馈，不代表没有问题。本轮可以作为无反馈关联的独立训练。</small>}
         {feedback.map(item => item.status === 'TRIAGED_FOR_REVIEW' && item.classification !== 'UNKNOWN'

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { registerHooks } from 'node:module';
 import * as domain from '../web/src/visionModelDomain.ts';
 import { scope, sha, seal, model, runtime, dataset, run, manifest, capabilities, list, operation, response, createRequest, approval, digest, poolProjection, poolDataset, feedbackFixture } from './web_vision_model_fixtures.mjs';
-import { trainingProposal, preflightReceipt } from './web_vision_model_fixtures.mjs';
+import { trainingProposal, preflightReceipt, pretrainingProposal, pretrainingRecipe } from './web_vision_model_fixtures.mjs';
 import { setIdentitySession, clearIdentitySession } from '../web/src/identitySession.ts';
 const stub = 'data:text/javascript,' + encodeURIComponent(`export class OperatorApiError extends Error { constructor(code,message,status){super(message);this.code=code;this.status=status;} } export function operatorFetch(...args){return globalThis.__visionTransport(...args);}`);
 const hooks = registerHooks({ resolve(specifier, context, next) { if ((context.parentURL?.endsWith('/data/visionModelApi.ts') || context.parentURL?.endsWith('/data/dataPoolApi.ts')) && specifier === './api') return { url: stub, shortCircuit: true }; return next(specifier, context); } });
@@ -62,6 +62,37 @@ test('training preflight rejects a response from a previous login generation eve
   const proposal = await trainingProposal(), receipt = await preflightReceipt(proposal);
   globalThis.__visionTransport = () => { identity(); return response(receipt); };
   await assert.rejects(api.previewVisionTraining(scope, proposal), hold);
+});
+
+test('pretraining recipe transport is planning-only and binds the annotation lineage and train-images digest', async () => {
+  identity();
+  const frozen = await poolDataset(), proposal = pretrainingProposal(frozen), result = await pretrainingRecipe(proposal, frozen);
+  let sends = 0;
+  globalThis.__visionTransport = (path, init) => {
+    sends++;
+    assert.equal(path, `/v1/projects/${scope.projectId}/vision-pretraining-recipe`);
+    assert.equal(init.method, 'POST');
+    assert.deepEqual(JSON.parse(init.body), proposal);
+    return response(result);
+  };
+  assert.deepEqual(await api.previewVisionPretrainingRecipe(scope, proposal, frozen), result);
+  await assert.rejects(api.previewVisionPretrainingRecipe(scope, proposal, await dataset()), hold);
+  await assert.rejects(api.previewVisionPretrainingRecipe(scope, { ...proposal, operator_attests_training_authorized: true }, frozen), hold);
+  await assert.rejects(api.previewVisionPretrainingRecipe(scope, { ...proposal, budget: { ...proposal.budget, patch_size: 12 } }, frozen), hold);
+  assert.equal(sends, 1);
+  for (const overrides of [
+    { status: 'READY_FOR_OPERATOR_REVIEW' }, { training_authorized: true }, { runtime_executed: true },
+    { lineage: { ...result.lineage, version_id: 'other_version' } }, { lineage: { ...result.lineage, annotation_bindings_sha256: sha('f') } },
+    { data: { ...result.data, gradient_split: 'val' } }, { data: { ...result.data, train_image_manifest_sha256: sha('f') } },
+    { data: { ...result.data, labels_role: 'OPTIMIZATION_TARGET' } },
+    { downstream: { ...result.downstream, checkpoint_status: 'READY' } }, { masked_patches_per_image: 15 },
+  ]) {
+    const altered = await pretrainingRecipe(proposal, frozen, overrides);
+    globalThis.__visionTransport = () => response(altered);
+    await assert.rejects(api.previewVisionPretrainingRecipe(scope, proposal, frozen), hold);
+  }
+  globalThis.__visionTransport = () => response(result);
+  await assert.rejects(api.previewVisionPretrainingRecipe(scope, { ...proposal, budget: { ...proposal.budget, seed: 3 } }, frozen), hold);
 });
 
 test('all actual resource schemas validate with JCS, strong ETag and content SHA', async () => {

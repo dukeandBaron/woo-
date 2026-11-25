@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { scope, sha, model, normalityModel, inferenceAsset, normalityInference, normalityPngBase64, previewInference, normalityFeedback, normalityFollowupImport, normalityFollowupWorkOrder, tttCapabilities, tttInference, tttFailure, seal, runtime, dataset, run, manifest, capabilities, poolProjection, poolDataset, feedbackFixture, newDetectionDataset } from './web_vision_model_fixtures.mjs';
+import { scope, sha, model, normalityModel, inferenceAsset, normalityInference, normalityPngBase64, previewInference, normalityFeedback, normalityFollowupImport, normalityFollowupWorkOrder, tttCapabilities, tttInference, tttFailure, seal, runtime, dataset, run, manifest, capabilities, poolProjection, poolDataset, feedbackFixture, newDetectionDataset, pretrainingProposal, pretrainingRecipe } from './web_vision_model_fixtures.mjs';
 const root = fileURLToPath(new URL('..', import.meta.url)), webRoot = path.join(root, 'web');
 const require = createRequire(path.join(webRoot, 'package.json'));
 const { build, transformWithOxc } = await import(pathToFileURL(require.resolve('vite')).href);
@@ -47,6 +47,11 @@ export async function operatorFetch(path,init={}){
    if(suffix.startsWith('vision-operations/')||suffix.startsWith('normality-followup-operations/')){const [,operation,request_key]=suffix.split('/');const item=window.__ledger[operation+':'+request_key];if(!item)throw new OperatorApiError('HTTP_404','not found',404);
     return response({schema_version:'visiondata-gate.vision-operation.v1',project_id:window.__scope.projectId,operation,request_key,resource_id:item.resource_id,resource:item,auto_replayed:false});}
    throw new OperatorApiError('HTTP_404','not found',404);
+ }
+ if(suffix==='vision-pretraining-recipe'){
+   const recipe=db.pretrainingRecipe;
+   if(!recipe)throw new OperatorApiError('HTTP_404','No recipe in synthetic test',404);
+   return response(recipe);
  }
  if(suffix==='vision-training-preflight'){
    if(window.__delayPreflight){window.__delayPreflight=false;await new Promise(resolve=>{window.__releasePreflight=resolve;});}
@@ -134,7 +139,7 @@ async function tab(page, name) { await page.getByRole('navigation', { name: '视
 function form(page) { return page.locator('.vision-models__form-panel form'); }
 async function review(target) { await target.getByLabel('具名复核人', { exact: true }).fill('合成复核员'); await target.getByLabel('本次操作说明').fill('这是独立合成测试的具名授权说明'); }
 async function checked(target, label) { await target.getByLabel(label, { exact: false }).check(); }
-async function writes(page) { return page.evaluate(() => window.__calls.filter(call => call.method === 'POST' && !call.path.endsWith('/vision-training-preflight'))); }
+async function writes(page) { return page.evaluate(() => window.__calls.filter(call => call.method === 'POST' && !/\/(vision-training-preflight|vision-pretraining-recipe)$/.test(call.path))); }
 function preflightButton(target) { return target.getByRole('button', { name: '运行预检（不启动训练）' }); }
 async function preflight(target) { await preflightButton(target).click(); await target.getByText('预检已核验 · 等待人工授权', { exact: true }).waitFor(); }
 
@@ -232,6 +237,35 @@ test('preflight is explicit, never writes, and data, weights, and budget invalid
     await page.evaluate(() => { window.__failPreflight = true; }); await preflightButton(target).click();
     await target.getByRole('alert').filter({ hasText: '预检' }).waitFor();
     assert.equal((await target.innerText()).includes('C:/private'), false); assert.equal((await writes(page)).length, 0);
+    assert.equal(await page.evaluate(() => Object.keys(localStorage).length), 0);
+  } finally { await page.close(); }
+});
+test('pretraining panel links governed annotations and frozen data to a held recipe, never to a training launch', async () => {
+  const page = await openPage(); try {
+    const governed = await seal({ ...await poolDataset(), dataset_id: 'vision_dataset_pool_test', resource_id: 'vision_dataset_pool_test' });
+    const expected = pretrainingProposal(governed), recipe = await pretrainingRecipe(expected, governed);
+    await page.evaluate(({ governed, recipe }) => { window.__db.datasets.push(governed); window.__db.pretrainingRecipe = recipe; }, { governed, recipe });
+    await page.getByRole('button', { name: '刷新状态（仅 GET）' }).click();
+    await tab(page, '训练'); const target = form(page);
+    const datasetField = target.getByLabel('冻结数据集', { exact: true });
+    await target.getByText('自监督预训练配方（只读）', { exact: true }).click();
+    const create = target.getByRole('button', { name: '核验并生成预训练配方' });
+    await datasetField.selectOption('vision_dataset_test'); assert.equal(await create.isEnabled(), false);
+    await datasetField.selectOption('vision_dataset_pool_test');
+    await create.click();
+    const hold = target.getByText('配方已核验 · HOLD：尚未接入预训练执行器', { exact: true });
+    await hold.waitFor();
+    assert.match(await target.innerText(), /poolv_test/);
+    assert.match(await target.innerText(), /标注只用于追溯/);
+    assert.match(await target.innerText(), /train 1 \/ val 1 \/ test 1/);
+    assert.equal(await target.getByRole('button', { name: '按本次授权启动 CPU 训练' }).isEnabled(), false);
+    const calls = await page.evaluate(() => window.__calls.filter(call => call.method === 'POST'));
+    assert.equal(calls.length, 1); assert.ok(calls[0].path.endsWith('/vision-pretraining-recipe')); assert.deepEqual(calls[0].request, expected);
+    await target.getByLabel('配方遮挡比例（%）', { exact: true }).fill('65');
+    assert.equal(await hold.count(), 0);
+    await create.click(); await target.getByRole('alert').filter({ hasText: '配方' }).waitFor(); // Stale, otherwise valid, response.
+    await datasetField.selectOption('vision_dataset_test'); assert.equal(await create.isEnabled(), false);
+    assert.equal((await writes(page)).length, 0);
     assert.equal(await page.evaluate(() => Object.keys(localStorage).length), 0);
   } finally { await page.close(); }
 });
